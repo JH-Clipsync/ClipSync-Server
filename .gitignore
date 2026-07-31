@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+clipsync-server
+clipsync-server-*
+*.test
+*.out
+vendor/
+
+# Build
+bin/
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Config (may contain secrets)
+config.yaml
+config.local.yaml
