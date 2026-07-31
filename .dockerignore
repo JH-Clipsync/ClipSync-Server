@@ -1,0 +1,15 @@
+# 排除构建时不需要的本地文件
+.git
+.gitignore
+.github
+.idea
+.vscode
+*.log
+*.md
+.DS_Store
+
+# 构建产物（容器里重新编译）
+clipsync-server
+
+# 本地日志（容器里用 volume 挂载）
+logs/

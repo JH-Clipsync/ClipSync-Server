@@ -1,0 +1,63 @@
+version: "3.8"
+
+# 用法：
+#   1. 把 ClipSync-Server 目录拷贝到服务器
+#   2. 在 ./config 目录放你的 config.yaml（直接 cp ../config.example.yaml ./config/config.yaml 后改）
+#   3. 第一次启动： docker compose up -d
+#   4. 看日志：     docker compose logs -f
+#   5. 重启：       docker compose restart
+#   6. 改配置后：   docker compose restart（配置是启动时加载，不支持热重载）
+
+services:
+  clipsync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gitwangjiahui/clipsync-server:latest
+    container_name: clipsync-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # 配置文件：宿主机的 ./config/config.yaml 映射到容器的 /data/config/config.yaml
+      - ./config:/data/config:ro
+      # 日志持久化：容器内 /data/logs → 宿主机 ./logs
+      - ./logs:/data/logs
+    environment:
+      # 以下任一环境变量都可覆盖 config.yaml 里的同名配置
+      - TZ=Asia/Shanghai
+      # 反代在前面时务必开 trust_proxy
+      - CLIPSYNC_TRUST_PROXY=true
+      # 也可直接改端口（同时记得把上面 ports 一起改）
+      # - CLIPSYNC_ADDR=:8080
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 可选：内置反代（Caddy）走 443 自动 HTTPS，前提是你有公网域名
+  # 取消下面的注释并填好域名即可启动
+  # caddy:
+  #   image: caddy:2-alpine
+  #   container_name: clipsync-caddy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   depends_on:
+  #     - clipsync
+
+# volumes:
+#   caddy_data:
+#   caddy_config:

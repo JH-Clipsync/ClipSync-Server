@@ -153,13 +153,17 @@ func (w *dailyRotatingWriter) Close() error {
 	return nil
 }
 
-// setupLogWriter 构建 "写通用日志文件 + 写控制台" 的 MultiWriter
-func setupLogWriter(dir, prefix string) (io.Writer, io.Closer, error) {
+// setupLogWriter 构建 "写通用日志文件 + (可选) 写控制台" 的 MultiWriter。
+// stdout=true 时同时输出到 stdout，便于 docker logs / kubectl logs。
+func setupLogWriter(dir, prefix string, stdout bool) (io.Writer, io.Closer, error) {
 	rw, err := newDailyRotatingWriter(dir, prefix)
 	if err != nil {
 		return nil, nil, err
 	}
-	return io.MultiWriter(os.Stdout, rw), rw, nil
+	if stdout {
+		return io.MultiWriter(os.Stdout, rw), rw, nil
+	}
+	return rw, rw, nil
 }
 
 // newCategoryLogger 构建一个"仅写自己那一份日志文件"的 *log.Logger，

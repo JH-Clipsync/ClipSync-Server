@@ -1,0 +1,13 @@
+# Caddy 反代配置示例
+# 拷贝为 ./Caddyfile，与 docker-compose.yml 同目录
+# 取消 https 那行注释并把 clipsync.example.com 换成你的域名
+
+:80 {
+    # 不带域名直接 80 端口时也能用（仅 HTTP）
+    reverse_proxy clipsync:8080
+}
+
+# clipsync.example.com {
+#     # 自动申请 Let's Encrypt 证书
+#     reverse_proxy clipsync:8080
+# }

@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -14,7 +20,7 @@ import (
 
 // ===== 消息类型常量 =====
 const (
-	// 通知类：由发送方明确指定投递范围
+	// NotifyPC / NotifyMobile / NotifyAll / Clipboard 见下
 	TypeNotifyPC     = "notify_pc"     // 只发给 PC 端（例：短信验证码同步到电脑）
 	TypeNotifyMobile = "notify_mobile" // 只发给移动端
 	TypeNotifyAll    = "notify_all"    // 广播给所有端（除自己）
@@ -22,6 +28,11 @@ const (
 	// 剪贴板类：广播给所有端；接收方按开关决定是否自动写入本机剪贴板
 	TypeClipboard = "clipboard"
 )
+
+// version 在编译时通过 -ldflags 注入：
+//
+//	go build -ldflags "-X main.version=1.0.0" .
+var version = "dev"
 
 // ===== Category：消息业务大类（三端统一） =====
 // 用于日志和 UI 分组，跟传输通道（TypeNotifyPC 等）解耦。
@@ -63,6 +74,9 @@ type Client struct {
 	send     chan []byte
 }
 
+// globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
+var globalConfig *Config
+
 // 集线器：按 token 分组管理连接
 type Hub struct {
 	mu      sync.RWMutex
@@ -77,6 +91,7 @@ var hub = &Hub{
 // 具体见 logger.go 的目录约定：logs/message.log（当日）+ logs/message/message-YYYY-MM-DD.log（归档）。
 var msgLog *log.Logger
 
+// upgrader 在 main 里被赋值，CheckOrigin 根据配置决定
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -130,18 +145,21 @@ func shortToken(t string) string {
 }
 
 // extractIP 从 HTTP 请求中提取客户端真实 IP：
-// 优先级：X-Forwarded-For（第一个） > X-Real-IP > RemoteAddr。
+// 优先级：X-Forwarded-For（第一个）> X-Real-IP > RemoteAddr。
+// 当 TrustProxy=false 时只取 RemoteAddr，避免被伪造头欺骗。
 // 用于反向代理（Nginx / Caddy）转发场景。
 func extractIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// XFF 可能是"client, proxy1, proxy2"，取最左边的原始客户端 IP
-		if idx := strings.IndexByte(xff, ','); idx >= 0 {
-			return strings.TrimSpace(xff[:idx])
+	if globalConfig != nil && globalConfig.Server.TrustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// XFF 可能是"client, proxy1, proxy2"，取最左边的原始客户端 IP
+			if idx := strings.IndexByte(xff, ','); idx >= 0 {
+				return strings.TrimSpace(xff[:idx])
+			}
+			return strings.TrimSpace(xff)
 		}
-		return strings.TrimSpace(xff)
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
 	}
 	// RemoteAddr 形如 "1.2.3.4:5678"，去掉端口
 	addr := r.RemoteAddr
@@ -295,10 +313,20 @@ func (c *Client) readPump() {
 		hub.unregister(c)
 		c.conn.Close()
 	}()
-	c.conn.SetReadLimit(10 * 1024 * 1024) // 10MB，剪贴板图片可能大
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	readLimit := int64(10 * 1024 * 1024)
+	readDeadline := 60 * time.Second
+	if globalConfig != nil {
+		if globalConfig.WebSocket.ReadLimit > 0 {
+			readLimit = globalConfig.WebSocket.ReadLimit
+		}
+		if globalConfig.WebSocket.ReadDeadlineSec > 0 {
+			readDeadline = time.Duration(globalConfig.WebSocket.ReadDeadlineSec) * time.Second
+		}
+	}
+	c.conn.SetReadLimit(readLimit) // 剪贴板图片可能大
+	c.conn.SetReadDeadline(time.Now().Add(readDeadline))
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(readDeadline))
 		return nil
 	})
 	for {
@@ -476,7 +504,17 @@ func extractPayloadMeta(payload json.RawMessage) (kind, mime, preview string) {
 }
 
 func (c *Client) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+	pingInterval := 30 * time.Second
+	writeDeadline := 10 * time.Second
+	if globalConfig != nil {
+		if globalConfig.WebSocket.PingIntervalSec > 0 {
+			pingInterval = time.Duration(globalConfig.WebSocket.PingIntervalSec) * time.Second
+		}
+		if globalConfig.WebSocket.WriteDeadlineSec > 0 {
+			writeDeadline = time.Duration(globalConfig.WebSocket.WriteDeadlineSec) * time.Second
+		}
+	}
+	ticker := time.NewTicker(pingInterval)
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
@@ -488,12 +526,12 @@ func (c *Client) writePump() {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return
 			}
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -525,13 +563,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("✗ WebSocket 升级失败: %v", err)
 		return
 	}
+	sendQueue := 32
+	if globalConfig != nil && globalConfig.WebSocket.SendQueueSize > 0 {
+		sendQueue = globalConfig.WebSocket.SendQueueSize
+	}
 	client := &Client{
 		conn:     conn,
 		token:    token,
 		deviceID: device,
 		role:     role,
 		ip:       extractIP(r),
-		send:     make(chan []byte, 32),
+		send:     make(chan []byte, sendQueue),
 	}
 	hub.register(client)
 	go client.writePump()
@@ -656,29 +698,102 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// 初始化通用日志：logs/clipsync.log（当日）+ logs/clipsync/clipsync-YYYY-MM-DD.log（归档）
-	logWriter, closer, err := setupLogWriter("logs", "clipsync")
+	// 命令行参数：--config 指向配置文件
+	configPath := flag.String("config", "", "配置文件路径（YAML）；也可用环境变量 CLIPSYNC_CONFIG")
+	showVersion := flag.Bool("version", false, "打印版本信息并退出")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("clipsync-server", version)
+		return
+	}
+
+	// 1. 加载配置
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+	globalConfig = cfg
+
+	// 2. 根据配置决定 upgrader 的 CheckOrigin 行为
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		if cfg.MessageProtocol.CheckOrigin {
+			return true // 允许任意 Origin
+		}
+		// 简单实现：只放行空 Origin（CLI 客户端）和 localhost
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		return strings.HasPrefix(origin, "http://localhost") ||
+			strings.HasPrefix(origin, "https://localhost") ||
+			strings.HasPrefix(origin, "app://")
+	}
+
+	// 3. 初始化通用日志：logs/clipsync.log（当日）+ logs/clipsync/clipsync-YYYY-MM-DD.log（归档）
+	logDir := cfg.Logs.Dir
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		log.Fatalf("创建日志目录失败: %v", err)
+	}
+	logWriter, closer, err := setupLogWriter(logDir, "clipsync", cfg.Logs.Stdout)
 	if err != nil {
 		log.Fatalf("初始化日志失败: %v", err)
 	}
 	defer closer.Close()
+	// setupLogWriter 内部已经按 Logs.Stdout 决定是否混入 stdout：
+	//   stdout=true  → 写到 stdout + 文件
+	//   stdout=false → 只写文件
 	log.SetOutput(logWriter)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	// 初始化消息推送专用日志：logs/message.log + logs/message/message-YYYY-MM-DD.log
-	ml, mlCloser, err := newCategoryLogger("logs", "message")
+	// 4. 初始化消息推送专用日志
+	ml, mlCloser, err := newCategoryLogger(logDir, "message")
 	if err != nil {
 		log.Fatalf("初始化消息日志失败: %v", err)
 	}
 	defer mlCloser.Close()
 	msgLog = ml
 
-	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/push", pushHandler)
-	addr := ":8080"
-	log.Printf("🚀 ClipSync 服务端启动，监听 %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatal(err)
+	// 5. 注册路由
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", wsHandler)
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/push", pushHandler)
+
+	srv := &http.Server{
+		Addr:         cfg.Server.Addr,
+		Handler:      mux,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+	}
+
+	// 6. 启动 + 优雅退出
+	log.Printf("🚀 ClipSync 服务端启动，监听 %s", cfg.Server.Addr)
+	log.Printf("📋 配置摘要: addr=%s logs.dir=%s trust_proxy=%v ws.read_limit=%d",
+		cfg.Server.Addr, cfg.Logs.Dir, cfg.Server.TrustProxy, cfg.WebSocket.ReadLimit)
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
+
+	// 监听系统信号实现优雅退出
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-errCh:
+		log.Fatalf("❌ HTTP 服务异常退出: %v", err)
+	case sig := <-quit:
+		log.Printf("👋 收到信号 %v，开始优雅退出（等待 %s）...", sig, cfg.Server.ShutdownTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("⚠ 优雅退出失败: %v", err)
+		}
+		log.Printf("✅ 已退出")
 	}
 }
