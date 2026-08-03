@@ -1,12 +1,15 @@
-version: "3.8"
-
 # 用法：
 #   1. 把 ClipSync-Server 目录拷贝到服务器
-#   2. 在 ./config 目录放你的 config.yaml（直接 cp ../config.example.yaml ./config/config.yaml 后改）
-#   3. 第一次启动： docker compose up -d
-#   4. 看日志：     docker compose logs -f
-#   5. 重启：       docker compose restart
-#   6. 改配置后：   docker compose restart（配置是启动时加载，不支持热重载）
+#   2. 复制环境变量模板：cp .env.example .env，然后改掉里面所有密码
+#   3. 可选：在 ./config 放 config.yaml（cp config.example.yaml config/config.yaml）
+#   4. 第一次启动： docker compose up -d
+#   5. 看日志：     docker compose logs -f clipsync
+#   6. 重启：       docker compose restart（配置是启动时加载，不支持热重载）
+#
+# 起来之后先登录拿 token：
+#   curl -X POST http://localhost:8080/auth/login \
+#     -H 'Content-Type: application/json' \
+#     -d '{"username":"admin","password":"<你的 BOOTSTRAP_PASSWORD>"}'
 
 services:
   clipsync:
@@ -16,6 +19,11 @@ services:
     image: gitwangjiahui/clipsync-server:latest
     container_name: clipsync-server
     restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
@@ -30,6 +38,28 @@ services:
       - CLIPSYNC_TRUST_PROXY=true
       # 也可直接改端口（同时记得把上面 ports 一起改）
       # - CLIPSYNC_ADDR=:8080
+
+      # ===== 存储：走 compose 内部网络，主机名就是服务名 =====
+      - CLIPSYNC_MYSQL_HOST=mysql
+      - CLIPSYNC_MYSQL_PORT=3306
+      - CLIPSYNC_MYSQL_USER=${MYSQL_USER:-clipsync}
+      - CLIPSYNC_MYSQL_PASSWORD=${MYSQL_PASSWORD:?请在 .env 里设置 MYSQL_PASSWORD}
+      - CLIPSYNC_MYSQL_DATABASE=${MYSQL_DATABASE:-clipsync}
+      - CLIPSYNC_REDIS_ADDR=redis:6379
+      - CLIPSYNC_REDIS_PASSWORD=${REDIS_PASSWORD:-}
+
+      # ===== 认证 =====
+      # token 有效期（小时），默认 30 天
+      - CLIPSYNC_TOKEN_TTL_HOURS=${TOKEN_TTL_HOURS:-720}
+      # 部署完建议改成 false，避免陌生人注册
+      - CLIPSYNC_ALLOW_REGISTER=${ALLOW_REGISTER:-true}
+      # 首次启动自动创建的账号（已存在则跳过）
+      - CLIPSYNC_BOOTSTRAP_USER=${BOOTSTRAP_USER:-admin}
+      - CLIPSYNC_BOOTSTRAP_PASSWORD=${BOOTSTRAP_PASSWORD:?请在 .env 里设置 BOOTSTRAP_PASSWORD}
+
+      # ===== 端到端加密 =====
+      # 三端都升级到支持加密的版本后改成 true，服务端会拒绝一切明文消息
+      - CLIPSYNC_E2EE_REQUIRE=${E2EE_REQUIRE:-false}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 30s
@@ -41,6 +71,54 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  mysql:
+    image: mysql:8.4
+    container_name: clipsync-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      - TZ=Asia/Shanghai
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:?请在 .env 里设置 MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-clipsync}
+      - MYSQL_USER=${MYSQL_USER:-clipsync}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:?请在 .env 里设置 MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 首次启动自动建库建表
+      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # 默认不对外暴露 3306；本地调试需要连库时再解开
+    # ports:
+    #   - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: clipsync-redis
+    restart: unless-stopped
+    # REDIS_PASSWORD 为空时不启用密码（仅内部网络可达）
+    command: >
+      sh -c 'if [ -n "$$REDIS_PASSWORD" ];
+             then exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD";
+             else exec redis-server --appendonly yes; fi'
+    environment:
+      - TZ=Asia/Shanghai
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   # 可选：内置反代（Caddy）走 443 自动 HTTPS，前提是你有公网域名
   # 取消下面的注释并填好域名即可启动
@@ -58,6 +136,8 @@ services:
   #   depends_on:
   #     - clipsync
 
-# volumes:
-#   caddy_data:
-#   caddy_config:
+volumes:
+  mysql_data:
+  redis_data:
+  # caddy_data:
+  # caddy_config:

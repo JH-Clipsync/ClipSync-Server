@@ -72,6 +72,10 @@ type Client struct {
 	role     string // pc | mobile
 	ip       string // 客户端 IP（优先取 X-Forwarded-For / X-Real-IP，否则 RemoteAddr）
 	send     chan []byte
+
+	// userID 鉴权后的账号 ID。同一账号的所有设备共享一个分组，
+	// 取代改造前"按 token 字符串分组"的做法。
+	userID int64
 }
 
 // globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
@@ -80,11 +84,11 @@ var globalConfig *Config
 // 集线器：按 token 分组管理连接
 type Hub struct {
 	mu      sync.RWMutex
-	clients map[string]map[*Client]bool // token -> clients
+	clients map[int64]map[*Client]bool // user_id -> clients
 }
 
 var hub = &Hub{
-	clients: make(map[string]map[*Client]bool),
+	clients: make(map[int64]map[*Client]bool),
 }
 
 // msgLog 专用记录"消息推送流水"（收/发/丢弃），独立成文件避免淹没通用日志。
@@ -98,34 +102,29 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-// 简单 token 校验，生产环境要换成真鉴权
-func validToken(t string) bool {
-	return t != ""
-}
-
 func (h *Hub) register(c *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if _, ok := h.clients[c.token]; !ok {
-		h.clients[c.token] = make(map[*Client]bool)
+	if _, ok := h.clients[c.userID]; !ok {
+		h.clients[c.userID] = make(map[*Client]bool)
 	}
-	h.clients[c.token][c] = true
-	log.Printf("🟢 上线: %s (%s) token=%s ip=%s — 该组在线 %d 台",
-		shortID(c.deviceID), c.role, shortToken(c.token), c.ip, len(h.clients[c.token]))
+	h.clients[c.userID][c] = true
+	logInfo("🟢 上线: %s (%s) user=%d token=%s ip=%s — 该组在线 %d 台",
+		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip, len(h.clients[c.userID]))
 }
 
 func (h *Hub) unregister(c *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if set, ok := h.clients[c.token]; ok {
+	if set, ok := h.clients[c.userID]; ok {
 		delete(set, c)
 		if len(set) == 0 {
-			delete(h.clients, c.token)
+			delete(h.clients, c.userID)
 		}
 	}
 	close(c.send)
-	log.Printf("⚪ 下线: %s (%s) token=%s ip=%s",
-		shortID(c.deviceID), c.role, shortToken(c.token), c.ip)
+	logInfo("⚪ 下线: %s (%s) user=%d token=%s ip=%s",
+		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
 }
 
 // shortID 只显示 device_id 前 8 位，日志更清爽
@@ -280,7 +279,7 @@ func targetRoleForType(msgType string) string {
 func (h *Hub) route(sender *Client, msgType string, raw []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	targets := h.clients[sender.token]
+	targets := h.clients[sender.userID]
 
 	wantRole := targetRoleForType(msgType)
 
@@ -337,7 +336,7 @@ func (c *Client) readPump() {
 		}
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
-			log.Printf("✗ 消息解析失败: %v", err)
+			logError("✗ 消息解析失败: %v", err)
 			continue
 		}
 		if msg.TS == 0 {
@@ -345,18 +344,34 @@ func (c *Client) readPump() {
 		}
 		// 强制覆盖 from，防止客户端伪造
 		msg.From = c.deviceID
-		// 短信类：清洗 payload（去除 【+86xxx】 前缀 / [N条] 合并提示，提取发件人）
-		msg.Payload = sanitizeSmsPayload(msg.Type, msg.Payload)
+
+		// 加密策略闸门：识别密文 / 按配置拒绝明文
+		encrypted, encErr := checkEncryption(msg.Payload)
+		if encErr != nil {
+			logWarn("⚠ 拒绝转发 %s(%s) 的消息: %v", shortID(c.deviceID), c.role, encErr)
+			msgLog.Printf("  ⛔ 已拒绝：%v (from=%s user=%d)", encErr, shortID(c.deviceID), c.userID)
+			continue
+		}
+
+		// 明文消息才做短信清洗；密文服务端看不到内容，清洗由发送端在加密前完成
+		if !encrypted {
+			msg.Payload = sanitizeSmsPayload(msg.Type, msg.Payload)
+		}
 		out, _ := json.Marshal(msg)
+
 		// 拆出元数据用于日志
 		kind, mime, preview := extractPayloadMeta(msg.Payload)
+		if encrypted {
+			env, _ := parseEnvelope(msg.Payload)
+			preview = encPreview(env)
+		}
 		category := categorize(msg.Type, kind)
 		content := contentTypeOf(kind, mime)
 		// 消息为主，元数据（分类·格式·推送方式）以中文释义附在括号中
-		msgLog.Printf("↑ 收到「%s」 [%s·%s·%s] from=%s(%s) token=%s ip=%s",
+		msgLog.Printf("↑ 收到「%s」 [%s·%s·%s] from=%s(%s) user=%d token=%s ip=%s",
 			preview,
 			zhCategory(category), zhContent(content), zhPush(msg.Type),
-			shortID(c.deviceID), c.role, shortToken(c.token), c.ip)
+			shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
 		hub.route(c, msg.Type, out)
 	}
 }
@@ -439,7 +454,28 @@ func sanitizeSmsPayload(msgType string, raw json.RawMessage) json.RawMessage {
 	return out
 }
 
-// ensurePreview 如果 payload.preview 为空，用 text 的前 40 字自动填充
+// previewLimit 返回预览截断长度，取自 message_protocol.max_payload_preview。
+// 未配置或非正数时回落到 40，与改造前的硬编码行为一致。
+func previewLimit() int {
+	if globalConfig != nil && globalConfig.MessageProtocol.MaxPayloadPreview > 0 {
+		return globalConfig.MessageProtocol.MaxPayloadPreview
+	}
+	return 40
+}
+
+// truncatePreview 按 previewLimit 截断，超长时补省略号。
+// 按 rune 计数，避免把中文截成半个字。
+func truncatePreview(s string) string {
+	limit := previewLimit()
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit]) + "…"
+}
+
+// ensurePreview 如果 payload.preview 为空，用 text 的前 N 字自动填充
+// （N = message_protocol.max_payload_preview）
 func ensurePreview(raw json.RawMessage) json.RawMessage {
 	var p map[string]any
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -450,23 +486,12 @@ func ensurePreview(raw json.RawMessage) json.RawMessage {
 	if preview != "" || text == "" {
 		return raw
 	}
-	runes := []rune(text)
-	if len(runes) > 40 {
-		p["preview"] = string(runes[:40]) + "…"
-	} else {
-		p["preview"] = text
-	}
+	p["preview"] = truncatePreview(text)
 	out, err := json.Marshal(p)
 	if err != nil {
 		return raw
 	}
 	return out
-}
-
-// extractPreview 从 payload JSON 里取一段简短预览
-func extractPreview(payload json.RawMessage) string {
-	_, _, preview := extractPayloadMeta(payload)
-	return preview
 }
 
 // extractPayloadMeta 一次性提取 payload.kind、payload.mime 和一行简短预览。
@@ -490,11 +515,7 @@ func extractPayloadMeta(payload json.RawMessage) (kind, mime, preview string) {
 	case p.Preview != "":
 		preview = p.Preview
 	case p.Text != "":
-		if runes := []rune(p.Text); len(runes) > 40 {
-			preview = string(runes[:40]) + "…"
-		} else {
-			preview = p.Text
-		}
+		preview = truncatePreview(p.Text)
 	case p.Kind != "":
 		preview = "[" + p.Kind + "]"
 	default:
@@ -553,14 +574,24 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		role = RolePC // 默认 pc（保守：能收到 notify_pc）
 	}
 
-	if !validToken(token) || device == "" {
+	if token == "" || device == "" {
 		http.Error(w, "参数错误: 需要 token 和 device", http.StatusBadRequest)
+		return
+	}
+
+	// 真鉴权：token 必须是登录接口签发且未过期的（Redis 命中优先，未命中回源 MySQL）
+	authCtx, authCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	userID, _, err := authGate.AuthenticateToken(authCtx, token)
+	authCancel()
+	if err != nil {
+		logWarn("⚠ 拒绝连接: device=%s ip=%s token 无效或已过期", shortID(device), extractIP(r))
+		http.Error(w, "认证失败: token 无效或已过期，请重新登录", http.StatusUnauthorized)
 		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("✗ WebSocket 升级失败: %v", err)
+		logError("✗ WebSocket 升级失败: %v", err)
 		return
 	}
 	sendQueue := 32
@@ -574,10 +605,61 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		role:     role,
 		ip:       extractIP(r),
 		send:     make(chan []byte, sendQueue),
+		userID:   userID,
 	}
+
+	// Redis 在线登记：登录接口靠它判断"当前用户是否已有客户端登录"
+	onlineTTL := onlineTTLDuration()
+	regCtx, regCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := authGate.MarkOnline(regCtx, userID, device, role, onlineTTL); err != nil {
+		logWarn("⚠ 在线登记失败（不影响转发）: %v", err)
+	}
+	regCancel()
+	defer func() {
+		offCtx, offCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := authGate.MarkOffline(offCtx, userID, device); err != nil {
+			logWarn("⚠ 在线登记清理失败: %v", err)
+		}
+		offCancel()
+	}()
+
 	hub.register(client)
 	go client.writePump()
+	go client.keepOnline(onlineTTL)
 	client.readPump()
+}
+
+// onlineTTLDuration 在线登记的 TTL，来自 redis.online_ttl_sec（默认 90s）。
+func onlineTTLDuration() time.Duration {
+	sec := 90
+	if globalConfig != nil && globalConfig.Redis.OnlineTTLSec > 0 {
+		sec = globalConfig.Redis.OnlineTTLSec
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// keepOnline 定期给 Redis 在线登记续期，周期取 TTL 的三分之一。
+// 连接断开时 c.send 被关闭，这里随之退出。
+func (c *Client) keepOnline(ttl time.Duration) {
+	interval := ttl / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		hub.mu.RLock()
+		_, alive := hub.clients[c.userID][c]
+		hub.mu.RUnlock()
+		if !alive {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := authGate.TouchOnline(ctx, c.userID, ttl); err != nil {
+			logDebug("在线登记续期失败: %v", err)
+		}
+		cancel()
+	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -599,7 +681,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 //	  -d '{"type":"clipboard","kind":"text","text":"你好世界"}'
 //
 // 参数：
-//   - token: 必须；决定推送给同 token 组内的哪些客户端
+//   - token: 必须；登录接口签发的 token，决定推送给该账号下的哪些客户端
+//     （也可放在 Authorization: Bearer <token> 头里）
 //   - body:  JSON，字段 type/kind/text/preview/mime/data 都可选
 //     type 缺省 = notify_pc
 //     kind 缺省 = 根据 type 自动推导
@@ -608,9 +691,24 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "只支持 POST", http.StatusMethodNotAllowed)
 		return
 	}
-	token := r.URL.Query().Get("token")
+	token := bearerToken(r)
 	if token == "" {
 		http.Error(w, "缺少 token 参数", http.StatusBadRequest)
+		return
+	}
+
+	// 鉴权：/push 是明文入口（给 curl 调试用），同样要求有效 token
+	authCtx, authCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	userID, _, err := authGate.AuthenticateToken(authCtx, token)
+	authCancel()
+	if err != nil {
+		http.Error(w, "认证失败: token 无效或已过期", http.StatusUnauthorized)
+		return
+	}
+
+	// e2ee.require 开启时，明文推送接口一律关闭——否则就成了绕过加密的后门
+	if globalConfig != nil && globalConfig.E2EE.Require {
+		http.Error(w, "服务端要求端到端加密，/push 明文接口已禁用", http.StatusForbidden)
 		return
 	}
 
@@ -662,7 +760,7 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	hub.mu.RLock()
-	targets := hub.clients[token]
+	targets := hub.clients[userID]
 	dispatched := 0
 	for c := range targets {
 		wantRole := targetRoleForType(body.Type)
@@ -678,14 +776,14 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 	total := len(targets)
 	hub.mu.RUnlock()
 
-	log.Printf("↑ /push %s (kind=%s) → 转发到 %d/%d 台", body.Type, body.Kind, dispatched, total)
+	logInfo("↑ /push %s (kind=%s) → 转发到 %d/%d 台", body.Type, body.Kind, dispatched, total)
 	// 消息推送流水另外写到消息日志，格式跟 WebSocket 通道一致（内容为主，元数据为辅）
-	msgLog.Printf("↑ 收到「%s」 [%s·%s·%s] from=http-push token=%s ip=%s → 转发到 %d/%d 台",
+	msgLog.Printf("↑ 收到「%s」 [%s·%s·%s] from=http-push user=%d token=%s ip=%s → 转发到 %d/%d 台",
 		body.Preview,
 		zhCategory(categorize(body.Type, body.Kind)),
 		zhContent(contentTypeOf(body.Kind, body.Mime)),
 		zhPush(body.Type),
-		shortToken(token), extractIP(r), dispatched, total)
+		userID, shortToken(token), extractIP(r), dispatched, total)
 
 	w.Header().Set("Content-Type", "application/json")
 	resp, _ := json.Marshal(map[string]any{
@@ -736,7 +834,7 @@ func main() {
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		log.Fatalf("创建日志目录失败: %v", err)
 	}
-	logWriter, closer, err := setupLogWriter(logDir, "clipsync", cfg.Logs.Stdout)
+	logWriter, closer, err := setupLogWriter(logDir, "clipsync", cfg.Logs.Stdout, cfg.Logs.MaxAgeDays)
 	if err != nil {
 		log.Fatalf("初始化日志失败: %v", err)
 	}
@@ -746,20 +844,51 @@ func main() {
 	//   stdout=false → 只写文件
 	log.SetOutput(logWriter)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	// 应用日志级别：低于该级别的 logDebug/logInfo/... 调用会被丢弃
+	SetLogLevel(parseLevel(cfg.Logs.Level))
 
 	// 4. 初始化消息推送专用日志
-	ml, mlCloser, err := newCategoryLogger(logDir, "message")
+	ml, mlCloser, err := newCategoryLogger(logDir, "message", cfg.Logs.MaxAgeDays)
 	if err != nil {
 		log.Fatalf("初始化消息日志失败: %v", err)
 	}
 	defer mlCloser.Close()
 	msgLog = ml
 
-	// 5. 注册路由
+	// 5. 初始化存储（MySQL 持久化 + Redis 缓存/在线态）与认证服务
+	store, err := OpenMySQL(cfg.MySQL)
+	if err != nil {
+		log.Fatalf("❌ %v", err)
+	}
+	defer store.Close()
+	logError("🗄  已连接 MySQL %s:%d/%s", cfg.MySQL.Host, cfg.MySQL.Port, cfg.MySQL.Database)
+
+	cache, err := OpenRedis(cfg.Redis)
+	if err != nil {
+		log.Fatalf("❌ %v", err)
+	}
+	defer cache.Close()
+	logError("⚡ 已连接 Redis %s (db=%d)", cfg.Redis.Addr, cfg.Redis.DB)
+
+	authService = NewAuthService(store, cache, cfg.Auth)
+	authGate = authService
+	limiter = newLoginLimiter(cfg.Auth.LoginRateLimitPerMin)
+
+	// 初始账号：配置了 bootstrap_user 且该用户不存在时自动建，方便首次部署
+	bootstrapUser(store, cfg.Auth)
+
+	// 过期会话清理：启动时跑一次，之后每小时一次
+	go purgeSessionsLoop(store)
+
+	// 6. 注册路由
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler)
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/push", pushHandler)
+	mux.HandleFunc("/auth/login", loginHandler)
+	mux.HandleFunc("/auth/register", registerHandler)
+	mux.HandleFunc("/auth/session", sessionHandler)
+	mux.HandleFunc("/auth/logout", logoutHandler)
 
 	srv := &http.Server{
 		Addr:         cfg.Server.Addr,
@@ -768,10 +897,14 @@ func main() {
 		WriteTimeout: cfg.Server.WriteTimeout,
 	}
 
-	// 6. 启动 + 优雅退出
-	log.Printf("🚀 ClipSync 服务端启动，监听 %s", cfg.Server.Addr)
-	log.Printf("📋 配置摘要: addr=%s logs.dir=%s trust_proxy=%v ws.read_limit=%d",
-		cfg.Server.Addr, cfg.Logs.Dir, cfg.Server.TrustProxy, cfg.WebSocket.ReadLimit)
+	// 7. 启动 + 优雅退出
+	// 启动横幅用 Error 级别，保证任何 level 配置下都能看到服务确实起来了
+	logError("🚀 ClipSync 服务端启动，监听 %s", cfg.Server.Addr)
+	logError("📋 配置摘要: addr=%s logs.dir=%s logs.level=%s logs.max_age_days=%d trust_proxy=%v ws.read_limit=%d preview_limit=%d",
+		cfg.Server.Addr, cfg.Logs.Dir, cfg.Logs.Level, cfg.Logs.MaxAgeDays,
+		cfg.Server.TrustProxy, cfg.WebSocket.ReadLimit, cfg.MessageProtocol.MaxPayloadPreview)
+	logError("🔐 认证配置: token_ttl=%dh allow_register=%v e2ee_require=%v login_rate_limit=%d/min",
+		cfg.Auth.TokenTTLHours, cfg.Auth.AllowRegister, cfg.E2EE.Require, cfg.Auth.LoginRateLimitPerMin)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -788,12 +921,12 @@ func main() {
 	case err := <-errCh:
 		log.Fatalf("❌ HTTP 服务异常退出: %v", err)
 	case sig := <-quit:
-		log.Printf("👋 收到信号 %v，开始优雅退出（等待 %s）...", sig, cfg.Server.ShutdownTimeout)
+		logError("👋 收到信号 %v，开始优雅退出（等待 %s）...", sig, cfg.Server.ShutdownTimeout)
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("⚠ 优雅退出失败: %v", err)
+			logWarn("⚠ 优雅退出失败: %v", err)
 		}
-		log.Printf("✅ 已退出")
+		logError("✅ 已退出")
 	}
 }

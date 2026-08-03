@@ -17,9 +17,12 @@ server:
 logs:
   # 日志根目录；容器里通常配 /data/logs，再挂载到宿主机
   dir: "logs"
-  # 日志级别：debug / info / warn / error（目前只作展示，后续会接入分级）
+  # 日志级别：debug / info / warn / error
+  # 低于该级别的通用日志会被丢弃；消息流水日志（message.log）是业务审计，不受此项影响。
+  # 启动横幅和退出日志始终打印，便于确认服务状态。
   level: "info"
   # 归档日志保留天数（0 = 不清理）
+  # >0 时在服务启动和每次跨天切割后，删除 logs/<prefix>/ 下超期的归档文件
   max_age_days: 0
   # 是否同时把日志输出到 stdout（容器部署建议 true，便于 docker logs / kubectl logs）
   stdout: true
@@ -39,7 +42,8 @@ websocket:
 message_protocol:
   # 是否允许任意 Origin 跨域 WebSocket（true = 全放行；生产建议 false 改走白名单）
   check_origin: true
-  # payload 预览最大字符数（只影响日志展示，不影响协议）
+  # payload 预览最大字符数（按中文字符计；超长补省略号）
+  # 影响日志展示，以及服务端自动补全 payload.preview 时的截断长度
   max_payload_preview: 40
 
 # ===== 环境变量覆盖（任选其一即可，无需改文件） =====
