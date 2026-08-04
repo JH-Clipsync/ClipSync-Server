@@ -21,7 +21,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ===== 阶段 2: 运行 =====
 # 用 distroless 基础镜像（含 ca-certificates、tzdata、wget、/etc/passwd）；
 # 没有 shell / 没有包管理器，攻击面最小。
-# 选 debian12 标签是因为要 wget 跑 HEALTHCHECK（static 镜像里没有）。
 FROM gcr.io/distroless/base-debian12:nonroot
 
 # 时区数据：让日志里 time.Local 走 UTC（distroless 默认 UTC）
@@ -34,7 +33,10 @@ USER nonroot:nonroot
 WORKDIR /app
 # 仅拷贝编译产物和示例配置（配置本身应通过 volume 挂载进来）
 COPY --from=builder /out/clipsync-server /app/clipsync-server
-COPY --from=builder /src/config.example.yaml /app/config.example.yaml
+# 默认配置已通过 go:embed 编译进二进制，容器内可用
+#   clipsync-server --print-default-config
+# 导出一份完整带注释的 YAML 作为 config.yaml 起点。
+COPY --from=builder /src/config.default.yaml /app/config.default.yaml
 
 # 暴露端口（与 config.yaml 默认值保持一致；docker run -p 可覆盖）
 EXPOSE 8080
@@ -46,10 +48,6 @@ VOLUME ["/data/logs", "/data/store"]
 # 启动时把 logs.dir 也指向 /data/logs，方便宿主机直接看
 ENV CLIPSYNC_LOG_DIR=/data/logs
 ENV CLIPSYNC_CONFIG=/data/config/config.yaml
-
-# 简易健康检查：直接访问 /health（distroless base 自带 wget）
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["wget", "-qO-", "http://127.0.0.1:8080/health"]
 
 ENTRYPOINT ["/app/clipsync-server"]
 # 默认参数：加载 /data/config/config.yaml（找不到时无害，直接走默认）

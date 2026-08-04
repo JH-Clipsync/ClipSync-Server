@@ -799,10 +799,18 @@ func main() {
 	// 命令行参数：--config 指向配置文件
 	configPath := flag.String("config", "", "配置文件路径（YAML）；也可用环境变量 CLIPSYNC_CONFIG")
 	showVersion := flag.Bool("version", false, "打印版本信息并退出")
+	dumpConfig := flag.Bool("print-default-config", false, "打印内置默认配置（YAML）并退出，可重定向成 config.yaml")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("clipsync-server", version)
+		return
+	}
+
+	// 导出一份带注释的完整配置，方便直接改：
+	//   clipsync-server --print-default-config > config.yaml
+	if *dumpConfig {
+		os.Stdout.Write(DefaultConfigYAML())
 		return
 	}
 

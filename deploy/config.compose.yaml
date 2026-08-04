@@ -1,0 +1,27 @@
+# 三件套都跑在 Docker 里时用的 config.yaml 起点：
+#   cp deploy/config.compose.yaml config/config.yaml
+#
+# 和内置默认配置的差别只有三处：
+#   1. mysql.host / redis.addr 用 compose 的服务名，不是 127.0.0.1
+#   2. logs.dir 指向容器里挂载出来的 /data/logs
+#   3. 账号密码要和 .env 里的 MYSQL_USER / MYSQL_PASSWORD 保持一致
+#
+# 其余字段不写就沿用内置默认值，想调什么再往里加即可
+# （完整字段清单：clipsync-server --print-default-config）。
+
+logs:
+  dir: "/data/logs"
+
+mysql:
+  # compose 网络里的服务名
+  host: "mysql"
+  port: 3306
+  # ⚠️ 必须和 .env 里的 MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE 一致
+  user: "clipsync"
+  password: "change-me-app"
+  database: "clipsync"
+
+redis:
+  addr: "redis:6379"
+  # .env 里设了 REDIS_PASSWORD 就同步填这里
+  password: ""
