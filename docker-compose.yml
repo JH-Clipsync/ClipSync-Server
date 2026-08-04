@@ -1,18 +1,39 @@
-# 用法：
-#   1. 把 ClipSync-Server 目录拷贝到服务器
-#   2. 复制环境变量模板：cp .env.example .env，然后改掉里面所有密码
-#   3. 可选：在 ./config 放 config.yaml（cp config.example.yaml config/config.yaml）
-#   4. 第一次启动： docker compose up -d
-#   5. 看日志：     docker compose logs -f clipsync
-#   6. 重启：       docker compose restart（配置是启动时加载，不支持热重载）
+# ClipSync 部署编排
+#
+# name 决定 Docker Desktop 里的分组名：mysql / redis / clipsync 会挂在
+# 「clipsync」这一组下面，而不是按目录名随机分组。
+#
+# ===== 开发：只起依赖，server 自己在宿主机跑 =====
+#   cp .env.example .env      # 改掉里面所有密码
+#   docker compose up -d      # 默认只起 mysql + redis
+#   docker compose ps         # 等 mysql 变成 healthy
+#
+#   然后自己起 server（把密码换成 .env 里的 MYSQL_PASSWORD）：
+#     export CLIPSYNC_MYSQL_PASSWORD=<你的 MYSQL_PASSWORD>
+#     export CLIPSYNC_BOOTSTRAP_USER=admin
+#     export CLIPSYNC_BOOTSTRAP_PASSWORD=<初始密码，至少 8 位>
+#     go run .
+#   代码默认就连 127.0.0.1:3306 / 127.0.0.1:6379，主机和端口无需再设。
+#   若 .env 里改了 MYSQL_HOST_PORT / REDIS_HOST_PORT，对应设置
+#   CLIPSYNC_MYSQL_PORT / CLIPSYNC_REDIS_ADDR 即可。
+#
+# ===== 生产：三件套一起起 =====
+#   mkdir -p config logs && cp config.example.yaml config/config.yaml
+#   docker compose --profile server up -d --build
+#   docker compose logs -f clipsync
 #
 # 起来之后先登录拿 token：
 #   curl -X POST http://localhost:8080/auth/login \
 #     -H 'Content-Type: application/json' \
 #     -d '{"username":"admin","password":"<你的 BOOTSTRAP_PASSWORD>"}'
 
+name: clipsync
+
 services:
   clipsync:
+    # server 归到 server profile：默认 up 不会启动它，
+    # 只有显式 --profile server 时才参与编排。
+    profiles: ["server"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -89,9 +110,10 @@ services:
       - mysql_data:/var/lib/mysql
       # 首次启动自动建库建表
       - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    # 默认不对外暴露 3306；本地调试需要连库时再解开
-    # ports:
-    #   - "3306:3306"
+    ports:
+      # 映射到宿主机，方便在容器外自己起 server 或用客户端连库。
+      # 只想让 compose 内部访问（更安全）就把这段注掉。
+      - "${MYSQL_HOST_PORT:-3306}:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD"]
       interval: 10s
@@ -111,6 +133,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    ports:
+      # 同 mysql：暴露给宿主机的 server 进程用
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:

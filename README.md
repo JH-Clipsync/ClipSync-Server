@@ -56,17 +56,32 @@ docker run -d --name clipsync-server -p 8080:8080 \
   ghcr.io/gitwangjiahui/clipsync-server:latest
 ```
 
-或用 compose：
+或用 compose。编排里 `name: clipsync` 固定了分组，`mysql` / `redis` / `clipsync`
+会挂在同一组下面。其中 `clipsync` 属于 `server` profile，**默认不启动**：
 
 ```bash
 git clone https://github.com/gitwangjiahui/ClipSync-Server.git
 cd ClipSync-Server
-cp config.example.yaml config/config.yaml   # 按需修改
+cp .env.example .env                        # 改掉里面所有密码
+
+# 只起依赖（mysql + redis），server 自己在宿主机跑 —— 开发常用
 docker compose up -d
-docker compose logs -f                      # 看日志
+docker compose ps                           # 等 mysql 变成 healthy
+export CLIPSYNC_MYSQL_PASSWORD=<.env 里的 MYSQL_PASSWORD>
+export CLIPSYNC_BOOTSTRAP_USER=admin
+export CLIPSYNC_BOOTSTRAP_PASSWORD=<初始密码，至少 8 位>
+go run .
+
+# 或者三件套一起交给 Docker —— 部署常用
+mkdir -p config logs && cp config.example.yaml config/config.yaml
+docker compose --profile server up -d --build
+docker compose logs -f clipsync
 ```
 
 启动后 `curl http://localhost:8080/health` 应返回 `ok`。
+
+MySQL / Redis 默认映射到宿主机 `3306` / `6379`，方便容器外的 server 直连；
+端口被占用就在 `.env` 里改 `MYSQL_HOST_PORT` / `REDIS_HOST_PORT`。
 
 ### 方式 2：下载二进制（免 Docker）
 
