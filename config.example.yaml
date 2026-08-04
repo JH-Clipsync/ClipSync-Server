@@ -46,9 +46,67 @@ message_protocol:
   # 影响日志展示，以及服务端自动补全 payload.preview 时的截断长度
   max_payload_preview: 40
 
+mysql:
+  # 用户与会话（token）持久化。表结构由服务端启动时自动创建，
+  # 也可以用 deploy/mysql/init.sql 预先建好。
+  host: "127.0.0.1"
+  port: 3306
+  user: "clipsync"
+  password: "clipsync"
+  database: "clipsync"
+  # DSN 附加参数；留空时用 charset=utf8mb4&parseTime=true&loc=Local
+  params: ""
+  max_open_conns: 20
+  max_idle_conns: 5
+  conn_max_lifetime_sec: 3600
+
+redis:
+  # token 校验缓存 + 在线设备登记
+  addr: "127.0.0.1:6379"
+  username: ""
+  password: ""
+  db: 0
+  # 所有 key 的统一前缀，方便和别的业务共用一个实例
+  key_prefix: "clipsync:"
+  # 在线登记 TTL（秒）。连接期间心跳会按 TTL/3 续期，
+  # 进程被 kill 时记录自然过期，不会留下幽灵在线设备。
+  online_ttl_sec: 90
+
+auth:
+  # token 有效期（小时），720 = 30 天
+  token_ttl_hours: 720
+  # 是否开放 POST /auth/register；部署完成后建议改 false
+  allow_register: true
+  # 注册时的最小密码长度
+  min_password_len: 8
+  # 启动时自动创建的初始账号（已存在则跳过）；留空表示不创建
+  bootstrap_user: ""
+  bootstrap_password: ""
+  # 单 IP 每分钟允许的登录尝试次数，防暴力破解（0 = 不限）
+  login_rate_limit_per_min: 10
+
+e2ee:
+  # true 时服务端拒绝转发任何明文消息，并关闭 /push 明文接口。
+  # 三端都升级到支持加密的版本后再打开。
+  require: false
+
 # ===== 环境变量覆盖（任选其一即可，无需改文件） =====
 # CLIPSYNC_ADDR            覆盖 server.addr
 # CLIPSYNC_LOG_DIR         覆盖 logs.dir
 # CLIPSYNC_LOG_LEVEL       覆盖 logs.level
 # CLIPSYNC_TRUST_PROXY     覆盖 server.trust_proxy（true/false）
 # CLIPSYNC_WS_READ_LIMIT   覆盖 websocket.read_limit（字节）
+# CLIPSYNC_MYSQL_HOST      覆盖 mysql.host
+# CLIPSYNC_MYSQL_PORT      覆盖 mysql.port
+# CLIPSYNC_MYSQL_USER      覆盖 mysql.user
+# CLIPSYNC_MYSQL_PASSWORD  覆盖 mysql.password
+# CLIPSYNC_MYSQL_DATABASE  覆盖 mysql.database
+# CLIPSYNC_REDIS_ADDR      覆盖 redis.addr
+# CLIPSYNC_REDIS_USERNAME  覆盖 redis.username
+# CLIPSYNC_REDIS_PASSWORD  覆盖 redis.password
+# CLIPSYNC_REDIS_DB        覆盖 redis.db
+# CLIPSYNC_TOKEN_TTL_HOURS 覆盖 auth.token_ttl_hours
+# CLIPSYNC_ALLOW_REGISTER  覆盖 auth.allow_register（true/false）
+# CLIPSYNC_BOOTSTRAP_USER      覆盖 auth.bootstrap_user
+# CLIPSYNC_BOOTSTRAP_PASSWORD  覆盖 auth.bootstrap_password
+# CLIPSYNC_E2EE_REQUIRE    覆盖 e2ee.require（true/false）
