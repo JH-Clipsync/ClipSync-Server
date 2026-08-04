@@ -69,8 +69,9 @@ redis:
 auth:
   # token 有效期（小时），720 = 30 天
   token_ttl_hours: 720
-  # 是否开放 POST /auth/register；部署完成后建议 false
-  allow_register: true
+  # 是否开放 POST /auth/register。默认关闭：账号由管理员创建，
+  # 客户端没有注册入口。临时开放注册时改成 true。
+  allow_register: false
   min_password_len: 8
   # 启动时自动创建的初始账号（已存在则跳过）；留空表示不创建
   bootstrap_user: ""

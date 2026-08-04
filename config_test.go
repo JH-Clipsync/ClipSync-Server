@@ -34,8 +34,9 @@ func TestDefaultConfigParses(t *testing.T) {
 		{"redis.addr", cfg.Redis.Addr, "127.0.0.1:6379"},
 		{"redis.key_prefix", cfg.Redis.KeyPrefix, "clipsync:"},
 		{"redis.online_ttl_sec", cfg.Redis.OnlineTTLSec, 90},
-		{"auth.token_ttl_hours", cfg.Auth.TokenTTLHours, 720},
-		{"auth.min_password_len", cfg.Auth.MinPasswordLen, 8},
+        {"auth.token_ttl_hours", cfg.Auth.TokenTTLHours, 720},
+        {"auth.allow_register", cfg.Auth.AllowRegister, false},
+        {"auth.min_password_len", cfg.Auth.MinPasswordLen, 8},
 		{"auth.login_rate_limit_per_min", cfg.Auth.LoginRateLimitPerMin, 10},
 		{"e2ee.require", cfg.E2EE.Require, false},
 	}
