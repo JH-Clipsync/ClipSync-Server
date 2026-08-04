@@ -38,8 +38,9 @@
 - **按 token 分组路由**：同 token 下 `role=phone` 的消息广播给所有 `role=pc`，反之亦然，互不串扰
 - **消息类型**：`notify_pc` / `notify_mobile` / `notify_all` / `clipboard` 四种投递语义
 - **短信清洗**：识别 `【】` 发件人、剥离 `+86` 前缀、提取 4-8 位验证码
-- **YAML 配置 + 环境变量覆盖**：优先级 `环境变量 > 配置文件 > 默认值`
-- **Docker 原生**：多阶段构建、distroless 非 root 运行、healthcheck、volume 持久化
+- **纯 YAML 配置**：默认值也是 YAML（`config.default.yaml`，go:embed 进二进制），
+  代码里零硬编码；`--print-default-config` 一键导出可改的完整配置
+- **Docker 原生**：多阶段构建、distroless 非 root 运行、volume 持久化
 - **优雅退出**：SIGINT/SIGTERM → `srv.Shutdown` 等待在途连接
 - **日志体系**：按天切割（`logs/xxx-YYYY-MM-DD.log`）+ 通用日志与消息推送日志分文件
 - **反代友好**：`trust_proxy` 开关，支持 X-Forwarded-For / X-Real-IP 取真实 IP
@@ -56,17 +57,35 @@ docker run -d --name clipsync-server -p 8080:8080 \
   ghcr.io/gitwangjiahui/clipsync-server:latest
 ```
 
-或用 compose：
+或用 compose。编排里 `name: clipsync` 固定了分组，`mysql` / `redis` / `clipsync`
+会挂在同一组下面。其中 `clipsync` 属于 `server` profile，**默认不启动**：
 
 ```bash
 git clone https://github.com/gitwangjiahui/ClipSync-Server.git
 cd ClipSync-Server
-cp config.example.yaml config/config.yaml   # 按需修改
+cp .env.example .env                        # 改掉里面所有密码
+
+# 只起依赖（mysql + redis），server 自己在宿主机跑 —— 开发常用
 docker compose up -d
-docker compose logs -f                      # 看日志
+docker compose ps                           # 确认 mysql / redis 都在 running
+
+go build -o clipsync-server .
+./clipsync-server --print-default-config > config.yaml
+# 改 config.yaml：mysql.password 与 .env 的 MYSQL_PASSWORD 一致，
+#                 auth.bootstrap_user / bootstrap_password 填初始账号
+./clipsync-server                           # 自动读取 ./config.yaml
+
+# 或者三件套一起交给 Docker —— 部署常用
+mkdir -p config logs
+cp deploy/config.compose.yaml config/config.yaml   # 已填好 compose 服务名
+docker compose --profile server up -d --build
+docker compose logs -f clipsync
 ```
 
 启动后 `curl http://localhost:8080/health` 应返回 `ok`。
+
+MySQL / Redis 默认映射到宿主机 `3306` / `6379`，方便容器外的 server 直连；
+端口被占用就在 `.env` 里改 `MYSQL_HOST_PORT` / `REDIS_HOST_PORT`。
 
 ### 方式 2：下载二进制（免 Docker）
 
@@ -97,8 +116,23 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o clipsync-serv
 
 ## 四、配置详解
 
+所有配置都在 YAML 里，Go 代码里没有硬编码的默认值。默认值的唯一来源是
+[config.default.yaml](config.default.yaml)，它通过 `go:embed` 编译进二进制。
+
+生成一份自己的配置文件：
+
+```bash
+./clipsync-server --print-default-config > config.yaml
+```
+
+导出的就是那份带完整注释的 YAML，改完重启即生效。你的 `config.yaml`
+**只需写想改的字段**，其余自动从内置默认值补齐。
+
 配置查找顺序：`--config 参数` → `CLIPSYNC_CONFIG` 环境变量 → `./config.yaml` → `/etc/clipsync/config.yaml`。
-找不到文件不报错，直接走默认值。完整示例见 [config.example.yaml](config.example.yaml)。
+找不到文件不报错，直接走默认值。
+
+> **MySQL / Redis 连接信息只认配置文件**，没有对应的环境变量覆盖。
+> 这样就不会出现"改了 config.yaml 却被残留环境变量悄悄盖掉"这种难查的问题。
 
 | 字段 | 说明 | 默认值 |
 |---|---|---|
@@ -118,7 +152,12 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o clipsync-serv
 | `message_protocol.check_origin` | 允许任意 Origin 跨域 | `true` |
 | `message_protocol.max_payload_preview` | 日志预览字符数 | `40` |
 
-环境变量覆盖（不想改文件时用）：`CLIPSYNC_ADDR` / `CLIPSYNC_LOG_DIR` / `CLIPSYNC_LOG_LEVEL` / `CLIPSYNC_TRUST_PROXY` / `CLIPSYNC_WS_READ_LIMIT`。
+仅以下少数字段支持环境变量覆盖，方便容器里临时改：
+`CLIPSYNC_ADDR` / `CLIPSYNC_LOG_DIR` / `CLIPSYNC_LOG_LEVEL` / `CLIPSYNC_TRUST_PROXY` /
+`CLIPSYNC_WS_READ_LIMIT` / `CLIPSYNC_TOKEN_TTL_HOURS` / `CLIPSYNC_ALLOW_REGISTER` /
+`CLIPSYNC_BOOTSTRAP_USER` / `CLIPSYNC_BOOTSTRAP_PASSWORD` / `CLIPSYNC_E2EE_REQUIRE`。
+
+**`mysql.*` 和 `redis.*` 不在其中**，请直接改 `config.yaml`。
 
 ⚠️ 改完配置需 `docker compose restart` / `systemctl restart`，当前不支持热重载。
 
@@ -173,11 +212,12 @@ location / {
 
 ```
 ├── main.go              # HTTP 路由 + WebSocket 消息处理 + 优雅退出
-├── config.go            # YAML 配置加载 + 环境变量覆盖 + 默认值
+├── config.go            # 配置结构定义 + YAML 加载（不含任何默认值）
 ├── logger.go            # 按天切割日志 Writer（通用 + 消息分类）
 ├── Dockerfile           # 多阶段构建 → distroless nonroot（~20MB）
 ├── docker-compose.yml   # 一键启动 + 可选 Caddy 反代
-├── config.example.yaml  # 完整配置示例
+├── config.default.yaml  # 内置默认配置（go:embed，默认值唯一来源）
+├── deploy/config.compose.yaml  # 全 Docker 部署时的 config.yaml 起点
 ├── Caddyfile.example    # HTTPS 反代示例
 └── .github/workflows/docker.yml  # 打 tag 自动推多架构镜像到 ghcr.io
 ```

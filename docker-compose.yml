@@ -1,29 +1,52 @@
-# 用法：
-#   1. 把 ClipSync-Server 目录拷贝到服务器
-#   2. 复制环境变量模板：cp .env.example .env，然后改掉里面所有密码
-#   3. 可选：在 ./config 放 config.yaml（cp config.example.yaml config/config.yaml）
-#   4. 第一次启动： docker compose up -d
-#   5. 看日志：     docker compose logs -f clipsync
-#   6. 重启：       docker compose restart（配置是启动时加载，不支持热重载）
+# ClipSync 部署编排
+#
+# name 决定 Docker Desktop 里的分组名：mysql / redis / clipsync 会挂在
+# 「clipsync」这一组下面，而不是按目录名随机分组。
+#
+# ===== 开发：只起依赖，server 自己在宿主机跑 =====
+#   cp .env.example .env      # 改掉里面所有密码
+#   docker compose up -d      # 默认只起 mysql + redis
+#   docker compose ps         # 确认 mysql / redis 都在 running
+#
+#   然后生成配置文件并按需修改，server 的一切配置都在这里：
+#     ./clipsync-server --print-default-config > config.yaml
+#     # 改 config.yaml 里的 mysql.password，与 .env 的 MYSQL_PASSWORD 一致
+#     # 顺手填上 auth.bootstrap_user / bootstrap_password 作为初始账号
+#     go run .                # 自动读取当前目录的 config.yaml
+#
+#   默认已经指向 127.0.0.1:3306 / 127.0.0.1:6379；
+#   .env 里改过 MYSQL_HOST_PORT / REDIS_HOST_PORT 的话，
+#   把 config.yaml 的 mysql.port / redis.addr 一起改掉即可。
+#
+# ===== 生产：三件套一起起 =====
+#   mkdir -p config logs
+#   cp deploy/config.compose.yaml config/config.yaml   # 已填好服务名与容器日志目录
+#   docker compose --profile server up -d --build
+#   docker compose logs -f clipsync
 #
 # 起来之后先登录拿 token：
 #   curl -X POST http://localhost:8080/auth/login \
 #     -H 'Content-Type: application/json' \
 #     -d '{"username":"admin","password":"<你的 BOOTSTRAP_PASSWORD>"}'
 
+name: clipsync
+
 services:
   clipsync:
+    # server 归到 server profile：默认 up 不会启动它，
+    # 只有显式 --profile server 时才参与编排。
+    profiles: ["server"]
     build:
       context: .
       dockerfile: Dockerfile
     image: gitwangjiahui/clipsync-server:latest
     container_name: clipsync-server
     restart: unless-stopped
+    # 没有健康检查，只保证启动顺序；mysql 首次初始化较慢时
+    # server 会连不上库并退出，restart: unless-stopped 会自动重试。
     depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - mysql
+      - redis
     ports:
       - "8080:8080"
     volumes:
@@ -32,21 +55,16 @@ services:
       # 日志持久化：容器内 /data/logs → 宿主机 ./logs
       - ./logs:/data/logs
     environment:
-      # 以下任一环境变量都可覆盖 config.yaml 里的同名配置
+      # ⚠️ MySQL / Redis 连接信息**不走环境变量**，只认 ./config/config.yaml
+      # 的 mysql / redis 段。容器内要连的是 compose 网络里的服务名，所以
+      # config/config.yaml 里请写：
+      #   mysql:  { host: "mysql", port: 3306, user/password/database 与 .env 一致 }
+      #   redis:  { addr: "redis:6379" }
       - TZ=Asia/Shanghai
       # 反代在前面时务必开 trust_proxy
       - CLIPSYNC_TRUST_PROXY=true
       # 也可直接改端口（同时记得把上面 ports 一起改）
       # - CLIPSYNC_ADDR=:8080
-
-      # ===== 存储：走 compose 内部网络，主机名就是服务名 =====
-      - CLIPSYNC_MYSQL_HOST=mysql
-      - CLIPSYNC_MYSQL_PORT=3306
-      - CLIPSYNC_MYSQL_USER=${MYSQL_USER:-clipsync}
-      - CLIPSYNC_MYSQL_PASSWORD=${MYSQL_PASSWORD:?请在 .env 里设置 MYSQL_PASSWORD}
-      - CLIPSYNC_MYSQL_DATABASE=${MYSQL_DATABASE:-clipsync}
-      - CLIPSYNC_REDIS_ADDR=redis:6379
-      - CLIPSYNC_REDIS_PASSWORD=${REDIS_PASSWORD:-}
 
       # ===== 认证 =====
       # token 有效期（小时），默认 30 天
@@ -60,12 +78,6 @@ services:
       # ===== 端到端加密 =====
       # 三端都升级到支持加密的版本后改成 true，服务端会拒绝一切明文消息
       - CLIPSYNC_E2EE_REQUIRE=${E2EE_REQUIRE:-false}
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
     logging:
       driver: json-file
       options:
@@ -89,15 +101,10 @@ services:
       - mysql_data:/var/lib/mysql
       # 首次启动自动建库建表
       - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    # 默认不对外暴露 3306；本地调试需要连库时再解开
-    # ports:
-    #   - "3306:3306"
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
+    ports:
+      # 映射到宿主机，方便在容器外自己起 server 或用客户端连库。
+      # 只想让 compose 内部访问（更安全）就把这段注掉。
+      - "${MYSQL_HOST_PORT:-3306}:3306"
 
   redis:
     image: redis:7-alpine
@@ -111,14 +118,11 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    ports:
+      # 同 mysql：暴露给宿主机的 server 进程用
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
 
   # 可选：内置反代（Caddy）走 443 自动 HTTPS，前提是你有公网域名
   # 取消下面的注释并填好域名即可启动

@@ -1,0 +1,85 @@
+# ClipSync-Server 内置默认配置
+#
+# 这份文件通过 go:embed 编译进二进制，是配置的唯一默认值来源
+# （代码里不再有任何硬编码的默认值）。
+#
+# 加载顺序：本文件 → 你的 config.yaml 覆盖同名字段 → 少量环境变量覆盖。
+# 想改配置改 config.yaml 就行，不用动这里；这里只是"什么都不填时长什么样"。
+
+server:
+  # 监听地址，":8080" 表示所有网卡
+  addr: ":8080"
+  # HTTP 读 / 写超时，支持 Go duration 字符串（"15s" / "1m"）
+  read_timeout: 15s
+  write_timeout: 15s
+  # 收到 SIGTERM 后等待在途连接的时间，超时强制退出
+  shutdown_timeout: 10s
+  # 反代在前面时置 true，才能从 X-Forwarded-For / X-Real-IP 取真实 IP
+  trust_proxy: false
+
+logs:
+  dir: "logs"
+  # debug / info / warn / error
+  level: "info"
+  # 归档日志保留天数，0 = 不清理
+  max_age_days: 0
+  # 容器部署建议 true，便于 docker logs
+  stdout: true
+
+websocket:
+  # 单条消息最大字节，10MB（剪贴板图片可能很大）
+  read_limit: 10485760
+  read_deadline_sec: 60
+  write_deadline_sec: 10
+  ping_interval_sec: 30
+  # 每客户端发送队列长度，满了丢弃并告警
+  send_queue_size: 32
+
+message_protocol:
+  # true = 放行任意 Origin 的 WebSocket 握手
+  check_origin: true
+  # payload 预览截断字符数
+  max_payload_preview: 40
+
+mysql:
+  # 用户与会话（token）持久化。表结构启动时自动创建。
+  host: "127.0.0.1"
+  port: 3306
+  user: "clipsync"
+  password: "clipsync"
+  database: "clipsync"
+  # DSN 附加参数；留空则用 charset=utf8mb4&parseTime=true&loc=Local
+  params: ""
+  max_open_conns: 20
+  max_idle_conns: 5
+  conn_max_lifetime_sec: 3600
+
+redis:
+  # token 校验缓存 + 在线设备登记
+  addr: "127.0.0.1:6379"
+  username: ""
+  password: ""
+  db: 0
+  # 所有 key 的统一前缀，便于和别的业务共用实例
+  key_prefix: "clipsync:"
+  # 在线登记 TTL（秒）；连接期间按 TTL/3 心跳续期，
+  # 进程被 kill 时记录自然过期，不留幽灵在线设备
+  online_ttl_sec: 90
+
+auth:
+  # token 有效期（小时），720 = 30 天
+  token_ttl_hours: 720
+  # 是否开放 POST /auth/register。默认关闭：账号由管理员创建，
+  # 客户端没有注册入口。临时开放注册时改成 true。
+  allow_register: false
+  min_password_len: 8
+  # 启动时自动创建的初始账号（已存在则跳过）；留空表示不创建
+  bootstrap_user: ""
+  bootstrap_password: ""
+  # 单 IP 每分钟登录尝试上限，防暴力破解（0 = 不限）
+  login_rate_limit_per_min: 10
+
+e2ee:
+  # true 时服务端拒绝转发任何明文消息，并关闭 /push 明文接口。
+  # 三端都升级到支持加密的版本后再打开。
+  require: false

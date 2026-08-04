@@ -2,13 +2,43 @@ package main
 
 import (
 	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // 一个字段完整的加密信封
 const validEnvelopeJSON = `{"enc":{"v":1,"alg":"AES-256-GCM","kdf":"PBKDF2-HMAC-SHA256",` +
 	`"iter":200000,"salt":"c2FsdHNhbHQ=","iv":"aXZpdml2aXZpdg==","ct":"Y2lwaGVydGV4dA==","fp":"a1b2c3d4e5f6a7b8"}}`
+
+// TestBuiltinSyncPasswordFingerprint 锁住「内置默认同步密码」在三端的一致性。
+//
+// 用户开了加密但没填密码时，三端都回落到 BuiltinSyncPassword。这里按客户端
+// 的派生规则算一遍指纹：任何一端改了常量或 KDF 参数，这个断言就会失败，
+// 提醒必须三端同步改（Android BuiltinSyncPasswordTest 有同样的哨兵）。
+func TestBuiltinSyncPasswordFingerprint(t *testing.T) {
+	const (
+		saltSeed    = "clipsync-e2ee-v1"
+		iterations  = 200000
+		wantPass    = "cs1-louuMZxNFCXgL1AcXjlBCly2E54NeH5T"
+		wantFingerp = "6cc296bd5bca6b1d"
+	)
+
+	if BuiltinSyncPassword != wantPass {
+		t.Fatalf("内置密码常量被改动：想要 %q，实际 %q（三端必须同步）", wantPass, BuiltinSyncPassword)
+	}
+
+	salt := sha256.Sum256([]byte(saltSeed))
+	key := pbkdf2.Key([]byte(BuiltinSyncPassword), salt[:], iterations, 32, sha256.New)
+	sum := sha256.Sum256(key)
+	got := hex.EncodeToString(sum[:])[:16]
+	if got != wantFingerp {
+		t.Fatalf("内置密码指纹不符：想要 %s，实际 %s", wantFingerp, got)
+	}
+}
 
 func TestParseEnvelopeAcceptsValid(t *testing.T) {
 	env, err := parseEnvelope(json.RawMessage(validEnvelopeJSON))

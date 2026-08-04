@@ -62,6 +62,18 @@ var ErrPlaintextRejected = errors.New("服务端要求端到端加密，拒绝�
 // ErrBadEnvelope 加密信封字段不完整或版本不支持
 var ErrBadEnvelope = errors.New("加密信封不合法")
 
+// BuiltinSyncPassword 是三端写死的「内置默认同步密码」。
+//
+// 用户开了端到端加密但没填自己的同步密码时，客户端就用这个值派生密钥。
+// 这样"开了加密却忘了填密码"不会退化成明文传输，同时两端不需要任何约定
+// 就能互通。它写死在各客户端里，安全性弱于用户自设密码，只是兜底默认值。
+//
+// 服务端本身不使用它（服务端从不派生密钥），放在这里是为了让三端共享同一份
+// 书面来源；Android 侧对应 E2EECrypto.BUILTIN_SYNC_PASSWORD，
+// Mac 侧对应 E2EECrypto.builtinSyncPassword。改动它会让所有仅依赖内置密码的
+// 历史密文无法解开，三端必须同时改。
+const BuiltinSyncPassword = "cs1-louuMZxNFCXgL1AcXjlBCly2E54NeH5T"
+
 // parseEnvelope 从 payload 里取出加密信封。
 // 返回 (nil, nil) 表示这是一条明文消息。
 func parseEnvelope(payload json.RawMessage) (*EncEnvelope, error) {

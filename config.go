@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"fmt"
 	"os"
 	"strconv"
@@ -9,6 +10,23 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// defaultConfigFS 把 config.default.yaml 编译进二进制。
+// 所有默认值都写在那份 YAML 里，Go 代码里不再有硬编码的配置值——
+// 想知道某项默认是什么，直接看 config.default.yaml 即可。
+//
+//go:embed config.default.yaml
+var defaultConfigFS embed.FS
+
+// DefaultConfigYAML 返回内置默认配置的原文，供 `--print-default-config` 输出。
+func DefaultConfigYAML() []byte {
+	data, err := defaultConfigFS.ReadFile("config.default.yaml")
+	if err != nil {
+		// go:embed 保证文件存在，读不到只可能是构建被破坏
+		panic(fmt.Sprintf("内置默认配置缺失: %v", err))
+	}
+	return data
+}
 
 // Config 服务端配置。从 YAML 文件加载，未设置的字段走默认值；
 // 部分字段还支持通过环境变量覆盖（环境变量优先级最高）。
@@ -166,59 +184,16 @@ type E2EEConfig struct {
 	Require bool `yaml:"require"`
 }
 
-// DefaultConfig 返回所有字段填好默认值的 Config
+// DefaultConfig 解析内置的 config.default.yaml，返回填好默认值的 Config。
+// 默认值只有那一处来源，改默认行为就改那份 YAML。
 func DefaultConfig() *Config {
-	return &Config{
-		Server: ServerConfig{
-			Addr:            ":8080",
-			ReadTimeout:     15 * time.Second,
-			WriteTimeout:    15 * time.Second,
-			ShutdownTimeout: 10 * time.Second,
-			TrustProxy:      false,
-		},
-		Logs: LogsConfig{
-			Dir:        "logs",
-			Level:      "info",
-			MaxAgeDays: 0,
-			Stdout:     true,
-		},
-		WebSocket: WebSocketConfig{
-			ReadLimit:        10 * 1024 * 1024,
-			ReadDeadlineSec:  60,
-			WriteDeadlineSec: 10,
-			PingIntervalSec:  30,
-			SendQueueSize:    32,
-		},
-		MessageProtocol: MessageProtocolConfig{
-			CheckOrigin:       true,
-			MaxPayloadPreview: 40,
-		},
-		MySQL: MySQLConfig{
-			Host:               "127.0.0.1",
-			Port:               3306,
-			User:               "clipsync",
-			Password:           "clipsync",
-			Database:           "clipsync",
-			MaxOpenConns:       20,
-			MaxIdleConns:       5,
-			ConnMaxLifetimeSec: 3600,
-		},
-		Redis: RedisConfig{
-			Addr:         "127.0.0.1:6379",
-			DB:           0,
-			KeyPrefix:    "clipsync:",
-			OnlineTTLSec: 90,
-		},
-		Auth: AuthConfig{
-			TokenTTLHours:        24 * 30,
-			AllowRegister:        true,
-			MinPasswordLen:       8,
-			LoginRateLimitPerMin: 10,
-		},
-		E2EE: E2EEConfig{
-			Require: false,
-		},
+	cfg := &Config{}
+	if err := yaml.Unmarshal(DefaultConfigYAML(), cfg); err != nil {
+		// 默认配置是随二进制一起编译的，解析失败属于构建期错误，
+		// 由单测（TestDefaultConfigParses）兜住，不该出现在运行时。
+		panic(fmt.Sprintf("内置默认配置解析失败: %v", err))
 	}
+	return cfg
 }
 
 // LoadConfig 从 YAML 文件加载配置，缺失字段用默认值补齐，最后再被环境变量覆盖。
@@ -288,40 +263,11 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 
-	// ===== MySQL =====
-	if v := os.Getenv("CLIPSYNC_MYSQL_HOST"); v != "" {
-		cfg.MySQL.Host = v
-	}
-	if v := os.Getenv("CLIPSYNC_MYSQL_PORT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.MySQL.Port = n
-		}
-	}
-	if v := os.Getenv("CLIPSYNC_MYSQL_USER"); v != "" {
-		cfg.MySQL.User = v
-	}
-	if v := os.Getenv("CLIPSYNC_MYSQL_PASSWORD"); v != "" {
-		cfg.MySQL.Password = v
-	}
-	if v := os.Getenv("CLIPSYNC_MYSQL_DATABASE"); v != "" {
-		cfg.MySQL.Database = v
-	}
-
-	// ===== Redis =====
-	if v := os.Getenv("CLIPSYNC_REDIS_ADDR"); v != "" {
-		cfg.Redis.Addr = v
-	}
-	if v := os.Getenv("CLIPSYNC_REDIS_USERNAME"); v != "" {
-		cfg.Redis.Username = v
-	}
-	if v := os.Getenv("CLIPSYNC_REDIS_PASSWORD"); v != "" {
-		cfg.Redis.Password = v
-	}
-	if v := os.Getenv("CLIPSYNC_REDIS_DB"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.Redis.DB = n
-		}
-	}
+	// ===== 中间件（MySQL / Redis）=====
+	//
+	// 有意不提供环境变量覆盖：连接信息全部由 config.yaml 的 mysql / redis 段决定，
+	// 改文件 + 重启即可生效，不必再去翻 compose 或 shell 里的 export。
+	// 这样也避免了"改了配置文件却被残留环境变量悄悄盖掉"这类难查的问题。
 
 	// ===== Auth =====
 	if v := os.Getenv("CLIPSYNC_TOKEN_TTL_HOURS"); v != "" {
