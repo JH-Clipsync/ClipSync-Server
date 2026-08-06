@@ -1,9 +1,9 @@
 # ===== 阶段 1: 构建 =====
 FROM golang:1.23-alpine AS builder
 
-# 国内网络环境可解开下面两行加速（任选一个镜像源）
-# RUN go env -w GOPROXY=https://goproxy.cn,direct
-# RUN go env -w GOSUMDB=sum.golang.google.cn
+# 国内服务器访问不了 proxy.golang.org，改用国内镜像
+RUN go env -w GOPROXY=https://goproxy.cn,direct
+RUN go env -w GOSUMDB=sum.golang.google.cn
 
 WORKDIR /src
 
