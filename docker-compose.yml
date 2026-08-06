@@ -8,14 +8,13 @@
 #   mkdir -p config logs
 #   cp deploy/config.external.yaml config/config.yaml
 #   # 修改 config.yaml 里的密码等
-#   docker compose up -d --profile server
+#   docker compose up -d
 #   docker compose logs -f clipsync
 
 name: clipsync
 
 services:
   clipsync:
-    profiles: ["server"]
     build:
       context: .
       dockerfile: Dockerfile
