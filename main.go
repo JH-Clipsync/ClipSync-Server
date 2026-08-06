@@ -389,8 +389,8 @@ func (c *Client) readPump() {
 // 不改动剪贴板/图片等其它 payload。
 
 var (
-	// 剥离所有前导的【xxx】块（可能嵌套多个，如 【+86xxx】【测试】）
-	reLeadingBrackets = regexp.MustCompile(`^(?:\s*【[^】]*】\s*)+`)
+	// 单个前导【xxx】块（带前后空白），用于循环定位第一个前缀
+	reLeadingBracket  = regexp.MustCompile(`^\s*【([^】]*)】\s*`)
 	// 从【】里提取号码/服务号（覆盖手机号、服务号、106 短信通道号）
 	rePhoneInside     = regexp.MustCompile(`【\s*([^】]*?)\s*】`)
 	// 判断是否为号码（包含至少 3 位连续数字）
@@ -448,8 +448,20 @@ func sanitizeSmsPayload(msgType string, raw json.RawMessage) json.RawMessage {
 		if s == "" {
 			return s
 		}
-		// 剥离所有前导【xxx】块（可能多个）
-		s = reLeadingBrackets.ReplaceAllString(s, "")
+		// 只剥离前导里【内容】含号码/服务号的前缀块（保留【招商银行】等签名）
+		for {
+			m := reLeadingBracket.FindStringSubmatch(s)
+			if m == nil {
+				break
+			}
+			content := strings.TrimSpace(m[1])
+			// 内容里含 3+ 位连续数字 → 视为号码前缀，删掉；
+			// 否则是服务商签名 → 停
+			if !reDigitLike.MatchString(content) {
+				break
+			}
+			s = reLeadingBracket.ReplaceAllString(s, "")
+		}
 		s = reMergeCount1.ReplaceAllString(s, "")
 		s = reMergeCount2.ReplaceAllString(s, "")
 		s = reLeadingEllips.ReplaceAllString(s, "")

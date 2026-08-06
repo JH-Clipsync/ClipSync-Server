@@ -1,0 +1,79 @@
+# ClipSync-Server 连接宿主机已有 Redis/MySQL 的配置
+#
+# 使用场景：服务器上已经有 Redis 和 MySQL 容器在跑，不想另起新容器。
+# 本服务通过 host 网络直接访问宿主机暴露的端口。
+#
+# 根据 docker ps 显示：
+#   Redis: 宿主机端口 5000 -> 容器内 6379
+#   MySQL: 宿主机端口 3306 -> 容器内 3306
+#
+# 启动步骤：
+#   mkdir -p config logs
+#   cp deploy/config.external.yaml config/config.yaml
+#   # 修改下面的 mysql.password / redis.password 等
+#   # 如果 MySQL 数据库还没建，先手动创建：
+#   #   mysql -h 127.0.0.1 -P 3306 -u root -p
+#   #   CREATE DATABASE IF NOT EXISTS clipsync CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+#   #   CREATE USER IF NOT EXISTS 'clipsync'@'%' IDENTIFIED BY 'clipsync';
+#   #   GRANT ALL PRIVILEGES ON clipsync.* TO 'clipsync'@'%';
+#   #   FLUSH PRIVILEGES;
+
+server:
+  addr: ":8080"
+  read_timeout: 15s
+  write_timeout: 15s
+  shutdown_timeout: 10s
+  trust_proxy: true
+
+logs:
+  dir: "/data/logs"
+  level: "info"
+  max_age_days: 0
+  stdout: true
+
+websocket:
+  read_limit: 10485760
+  read_deadline_sec: 60
+  write_deadline_sec: 10
+  ping_interval_sec: 30
+  send_queue_size: 32
+
+message_protocol:
+  check_origin: true
+  max_payload_preview: 40
+
+# ===== MySQL 配置 =====
+# 连接宿主机已有的 MySQL 容器
+mysql:
+  host: "127.0.0.1"
+  port: 3306        # ⚠️ 如果你的 MySQL 容器映射到 13306，这里改成 13306
+  user: "clipsync"
+  password: "clipsync"   # ⚠️ 改成你现有 MySQL 的 clipsync 用户密码
+  database: "clipsync"
+  params: ""
+  max_open_conns: 20
+  max_idle_conns: 5
+  conn_max_lifetime_sec: 3600
+
+# ===== Redis 配置 =====
+# 连接宿主机已有的 Redis 容器
+redis:
+  addr: "127.0.0.1:5000"  # ⚠️ 如果你的 Redis 容器映射到其他端口，这里修改
+  username: ""
+  password: ""              # ⚠️ 如果你的 Redis 有密码，这里填
+  db: 0
+  key_prefix: "clipsync:"
+  online_ttl_sec: 90
+
+# ===== 认证 =====
+auth:
+  token_ttl_hours: 720
+  allow_register: true
+  min_password_len: 8
+  bootstrap_user: "admin"
+  bootstrap_password: "admin123"  # ⚠️ 改成你的初始密码
+  login_rate_limit_per_min: 10
+
+# ===== 端到端加密 =====
+e2ee:
+  require: false
