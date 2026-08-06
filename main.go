@@ -389,11 +389,15 @@ func (c *Client) readPump() {
 // 不改动剪贴板/图片等其它 payload。
 
 var (
-	rePhonePrefix   = regexp.MustCompile(`^\s*【\s*\+?86\s*\d{6,15}\s*】`)
-	rePhoneInside   = regexp.MustCompile(`【\s*\+?(?:86)?\s*(1\d{10})\s*】`)
-	reMergeCount1   = regexp.MustCompile(`\[\s*\d+\s*条\s*\]`)
-	reMergeCount2   = regexp.MustCompile(`(?i)\[x\s*\d+\s*\]`)
-	reLeadingEllips = regexp.MustCompile(`^\s*(?:\.{3,}|…+)\s*`)
+	// 剥离所有前导的【xxx】块（可能嵌套多个，如 【+86xxx】【测试】）
+	reLeadingBrackets = regexp.MustCompile(`^(?:\s*【[^】]*】\s*)+`)
+	// 从【】里提取号码/服务号（覆盖手机号、服务号、106 短信通道号）
+	rePhoneInside     = regexp.MustCompile(`【\s*([^】]*?)\s*】`)
+	// 判断是否为号码（包含至少 3 位连续数字）
+	reDigitLike       = regexp.MustCompile(`\d{3,}`)
+	reMergeCount1     = regexp.MustCompile(`\[\s*\d+\s*条\s*\]`)
+	reMergeCount2     = regexp.MustCompile(`(?i)\[x\s*\d+\s*\]`)
+	reLeadingEllips   = regexp.MustCompile(`^\s*(?:\.{3,}|…+)\s*`)
 )
 
 func sanitizeSmsPayload(msgType string, raw json.RawMessage) json.RawMessage {
@@ -413,14 +417,28 @@ func sanitizeSmsPayload(msgType string, raw json.RawMessage) json.RawMessage {
 	text, _ := p["text"].(string)
 	preview, _ := p["preview"].(string)
 
-	// 抽发件人手机号（优先从 text，再退到 preview）
+	// 抽发件人：遍历所有【xxx】块，找第一个包含 3 位以上数字的（可能带 +86 前缀）
 	sender := ""
 	for _, s := range []string{text, preview} {
 		if s == "" {
 			continue
 		}
-		if m := rePhoneInside.FindStringSubmatch(s); len(m) > 1 {
-			sender = m[1]
+		matches := rePhoneInside.FindAllStringSubmatch(s, -1)
+		for _, m := range matches {
+			if len(m) > 1 {
+				candidate := strings.TrimSpace(m[1])
+				// 去掉可能的 +86 / 86 前缀
+				candidate = strings.TrimLeft(candidate, "+")
+				candidate = strings.TrimPrefix(candidate, "86")
+				candidate = strings.TrimSpace(candidate)
+				// 必须包含至少 3 位数字才视为号码
+				if reDigitLike.MatchString(candidate) {
+					sender = candidate
+					break
+				}
+			}
+		}
+		if sender != "" {
 			break
 		}
 	}
@@ -430,10 +448,10 @@ func sanitizeSmsPayload(msgType string, raw json.RawMessage) json.RawMessage {
 		if s == "" {
 			return s
 		}
-		s = rePhonePrefix.ReplaceAllString(s, "")
+		// 剥离所有前导【xxx】块（可能多个）
+		s = reLeadingBrackets.ReplaceAllString(s, "")
 		s = reMergeCount1.ReplaceAllString(s, "")
 		s = reMergeCount2.ReplaceAllString(s, "")
-		// 去掉开头残留的 "..." / "…"（部分厂商通知栏折叠预览会在开头加上省略号）
 		s = reLeadingEllips.ReplaceAllString(s, "")
 		return strings.TrimSpace(s)
 	}
