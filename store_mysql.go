@@ -140,6 +140,23 @@ func (s *MySQLStore) FindUserByName(ctx context.Context, username string) (*User
 	return &u, nil
 }
 
+// FindUserByID 按 ID 查，找不到返回 ErrUserNotFound。
+func (s *MySQLStore) FindUserByID(ctx context.Context, userID int64) (*User, error) {
+	var u User
+	var disabled int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, username, password_hash, disabled, created_at FROM users WHERE id = ?`,
+		userID).Scan(&u.ID, &u.Username, &u.PasswordHash, &disabled, &u.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("查询用户失败: %w", err)
+	}
+	u.Disabled = disabled != 0
+	return &u, nil
+}
+
 // GetSession 取用户当前会话；没有或已过期都返回 nil, nil。
 func (s *MySQLStore) GetSession(ctx context.Context, userID int64) (*Session, error) {
 	var sess Session
@@ -190,6 +207,19 @@ func (s *MySQLStore) FindUserByTokenHash(ctx context.Context, tokenHash string) 
 	}
 	u.Disabled = disabled != 0
 	return &u, nil
+}
+
+// UpdatePassword 修改用户密码哈希。
+func (s *MySQLStore) UpdatePassword(ctx context.Context, userID int64, passwordHash string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE users SET password_hash = ? WHERE id = ?`, passwordHash, userID)
+	if err != nil {
+		return fmt.Errorf("修改密码失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrUserNotFound
+	}
+	return nil
 }
 
 // DeleteSession 登出：删掉用户的活跃会话。

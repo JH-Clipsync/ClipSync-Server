@@ -247,3 +247,47 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("👋 已登出，token 作废 (%s) ip=%s", shortToken(token), extractIP(r))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
+
+// changePasswordHandler POST /auth/change-password
+// 请求：{"old_password":"...","new_password":"..."}  需 Bearer token 鉴权
+// 改完后旧 token 立即失效，所有在线连接被踢；返回新 token 供客户端替换。
+func changePasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "只支持 POST")
+		return
+	}
+	token := bearerToken(r)
+	if token == "" {
+		writeErr(w, http.StatusUnauthorized, "缺少 token")
+		return
+	}
+	var body struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if body.OldPassword == "" || body.NewPassword == "" {
+		writeErr(w, http.StatusBadRequest, "old_password 和 new_password 不能为空")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	newToken, err := authService.ChangePassword(ctx, token, body.OldPassword, body.NewPassword)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidCredentials):
+			writeErr(w, http.StatusUnauthorized, "旧密码不正确或 token 已失效")
+		case errors.Is(err, ErrWeakPassword):
+			writeErr(w, http.StatusBadRequest, "新密码太短")
+		default:
+			logError("✗ 修改密码异常: %v", err)
+			writeErr(w, http.StatusInternalServerError, "服务端异常")
+		}
+		return
+	}
+	logInfo("🔑 密码已修改，旧 token 已作废 ip=%s", extractIP(r))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "token": newToken})
+}

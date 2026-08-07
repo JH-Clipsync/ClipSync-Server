@@ -127,6 +127,40 @@ func (h *Hub) unregister(c *Client) {
 		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
 }
 
+// kickUser 强制断开 userID 下的所有连接。
+// 由管理端重置密码 / 封禁用户时触发。
+// 调用 Close() 会让 readPump 下一次 ReadMessage 返回错误，
+// defer 里自动走 unregister + 清理在线登记 + 关闭 writePump。
+func (h *Hub) kickUser(userID int64) int {
+	h.mu.RLock()
+	set := h.clients[userID]
+	targets := make([]*Client, 0, len(set))
+	for c := range set {
+		targets = append(targets, c)
+	}
+	h.mu.RUnlock()
+
+	n := len(targets)
+	if n == 0 {
+		return 0
+	}
+	// 先发踢下线通知，客户端收到后主动断开并提示用户
+	kickMsg, _ := json.Marshal(Message{
+		ID:      "server_kick",
+		Type:    "server_kick",
+		From:    "server",
+		TS:      time.Now().UnixMilli(),
+		Payload: json.RawMessage(`{}`),
+	})
+	for _, c := range targets {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_ = c.conn.WriteMessage(websocket.TextMessage, kickMsg)
+		_ = c.conn.Close()
+	}
+	logInfo("👟 强制下线 user=%d，断开 %d 台连接", userID, n)
+	return n
+}
+
 // shortID 只显示 device_id 前 8 位，日志更清爽
 func shortID(id string) string {
 	if len(id) > 8 {
@@ -918,6 +952,38 @@ func main() {
 	// 过期会话清理：启动时跑一次，之后每小时一次
 	go purgeSessionsLoop(store)
 
+	// 管理端事件订阅：重置密码 / 封禁用户时强制下线所有连接
+	{
+		adminCtx, adminCancel := context.WithCancel(context.Background())
+		_ = adminCancel // 进程退出时随 HTTP Server 一起被回收
+		go func() {
+			backoff := 1 * time.Second
+			for {
+				err := cache.SubscribeKickUser(adminCtx, func(userID int64) {
+					// 额外清理会话：管理端重置密码后老 token 必须失效
+					ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+					if th, err := cache.rdb.Get(ctx2, cache.userTokenKey(userID)).Result(); err == nil && th != "" {
+						_ = cache.DropToken(ctx2, th, userID)
+					}
+					_ = cache.DropPlainToken(ctx2, userID)
+					_ = store.DeleteSession(ctx2, userID)
+					cancel2()
+					hub.kickUser(userID)
+				})
+				// context 被取消：优雅退出
+				if adminCtx.Err() != nil {
+					return
+				}
+				logWarn("⚠ 管理端事件订阅断开: %v，%v 后重连", err, backoff)
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+			}
+		}()
+		logError("📡 管理端事件订阅已启动，频道: %s", cache.KickUserChannel())
+	}
+
 	// 6. 注册路由
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler)
@@ -927,6 +993,7 @@ func main() {
 	mux.HandleFunc("/auth/register", registerHandler)
 	mux.HandleFunc("/auth/session", sessionHandler)
 	mux.HandleFunc("/auth/logout", logoutHandler)
+	mux.HandleFunc("/auth/change-password", changePasswordHandler)
 
 	srv := &http.Server{
 		Addr:         cfg.Server.Addr,

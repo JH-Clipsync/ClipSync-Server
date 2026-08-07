@@ -47,6 +47,17 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
 
+      - name: 从 git ref 提取版本号
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "::notice::APP_VERSION=$VER"
+
       - name: Build and push (amd64 + arm64)
         uses: docker/build-push-action@v6
         with:
@@ -55,5 +66,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

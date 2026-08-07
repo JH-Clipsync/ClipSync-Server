@@ -175,3 +175,47 @@ func (s *RedisStore) OnlineDevices(ctx context.Context, userID int64) (map[strin
 	}
 	return m, nil
 }
+
+// ===== 管理端事件通道 =====
+//
+// 管理端（ClipSync-Admin）和服务端共享同一个 Redis 实例时，
+// 用 Pub/Sub 解耦跨服务通知。管理端是发布方，服务端是订阅方。
+//
+// 频道：{prefix}admin:kick_user （消息 = userID 十进制字符串）
+//   - 触发场景：管理端重置 C 端用户密码、封禁用户
+//   - 动作：hub.kickUser(userID) 关闭该用户所有 WebSocket 连接
+
+// KickUserChannel 返回管理端强制下线的 Pub/Sub 频道名。
+func (s *RedisStore) KickUserChannel() string {
+	return s.prefix + "admin:kick_user"
+}
+
+// PublishKickUser 向管理端频道发布强制下线事件。
+// 由 ClipSync-Admin 调用；ClipSync-Server 自己是订阅方。
+func (s *RedisStore) PublishKickUser(ctx context.Context, userID int64) error {
+	return s.rdb.Publish(ctx, s.KickUserChannel(), fmt.Sprintf("%d", userID)).Err()
+}
+
+// SubscribeKickUser 订阅管理端强制下线事件，阻塞运行，
+// 每收到一次 userID 就调用回调。ctx 取消时退出。
+// 重连由调用方负责，本方法内部不做无限重试。
+func (s *RedisStore) SubscribeKickUser(ctx context.Context, onKick func(userID int64)) error {
+	sub := s.rdb.Subscribe(ctx, s.KickUserChannel())
+	defer sub.Close()
+	ch := sub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			userID, err := strconv.ParseInt(msg.Payload, 10, 64)
+			if err != nil {
+				continue
+			}
+			onKick(userID)
+		}
+	}
+}

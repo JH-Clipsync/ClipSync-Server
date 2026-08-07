@@ -11,11 +11,14 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
+# 版本号通过构建参数传入（workflow 中来自 git tag）
+ARG APP_VERSION=dev
+
 # 复制源码并编译
 COPY . .
 # 静态链接（不需要 glibc），适合 scratch / distroless 镜像
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags "-s -w -X main.version=$(date -u +%Y%m%d)" \
+    -ldflags "-s -w -X main.version=${APP_VERSION}" \
     -o /out/clipsync-server .
 
 # ===== 阶段 2: 运行 =====

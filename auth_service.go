@@ -253,6 +253,62 @@ func (a *AuthService) Logout(ctx context.Context, token string) error {
 	return a.cache.DropPlainToken(ctx, userID)
 }
 
+// ChangePassword 修改密码：验证旧密码 → 更新数据库 → 作废所有旧 token → 发 kick 踢掉在线连接。
+// 返回新签发的 token，客户端拿到后替换本地缓存的旧 token。
+func (a *AuthService) ChangePassword(ctx context.Context, token, oldPassword, newPassword string) (string, error) {
+	if len(newPassword) < a.cfg.MinPasswordLen {
+		return "", ErrWeakPassword
+	}
+	userID, _, err := a.AuthenticateToken(ctx, token)
+	if err != nil {
+		return "", ErrInvalidCredentials
+	}
+	user, err := a.db.FindUserByID(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if !VerifyPassword(user.PasswordHash, oldPassword) {
+		return "", ErrInvalidCredentials
+	}
+	hash, err := HashPassword(newPassword)
+	if err != nil {
+		return "", err
+	}
+	if err := a.db.UpdatePassword(ctx, userID, hash); err != nil {
+		return "", err
+	}
+	// 作废旧会话 + 缓存
+	oldHash := TokenHash(token)
+	_ = a.db.DeleteSession(ctx, userID)
+	_ = a.cache.DropToken(ctx, oldHash, userID)
+	_ = a.cache.DropPlainToken(ctx, userID)
+	// 踢掉所有在线连接，让它们立即断开
+	_ = a.cache.PublishKickUser(ctx, userID)
+
+	// 签发新 token 返回给调用方
+	ttl := time.Duration(a.cfg.TokenTTLHours) * time.Hour
+	newToken, err := NewToken()
+	if err != nil {
+		return "", err
+	}
+	sess := &Session{
+		UserID:    userID,
+		TokenHash: TokenHash(newToken),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(ttl),
+	}
+	if err := a.db.UpsertSession(ctx, sess); err != nil {
+		return "", err
+	}
+	if err := a.cache.CacheToken(ctx, sess.TokenHash, userID, ttl); err != nil {
+		return "", err
+	}
+	if err := a.cache.StorePlainToken(ctx, userID, newToken, ttl); err != nil {
+		return "", err
+	}
+	return newToken, nil
+}
+
 // bootstrapUser 按配置创建初始账号：已存在则跳过，不改动已有密码。
 // 目的是让 docker compose 起来就能直接登录，不用先手动注册。
 func bootstrapUser(db *MySQLStore, cfg AuthConfig) {
