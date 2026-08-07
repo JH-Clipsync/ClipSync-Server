@@ -11,10 +11,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/gitwangjiahui/ClipSync-Server/releases">⬇️ 下载 Release</a> ·
-  <a href="https://github.com/orgs/gitwangjiahui/packages">📦 Packages (ghcr.io)</a> ·
-  <a href="https://github.com/gitwangjiahui/ClipSync-Android">📱 Android 端</a> ·
-  <a href="https://github.com/gitwangjiahui/ClipSync-Mac">🖥️ Mac 端</a>
+  <a href="https://github.com/JH-Clipsync/ClipSync-Server/releases">⬇️ 下载 Release</a> ·
+  <a href="https://github.com/orgs/JH-Clipsync/packages">📦 Packages (ghcr.io)</a> ·
+  <a href="https://github.com/JH-Clipsync/ClipSync-Android">📱 Android 端</a> ·
+  <a href="https://github.com/JH-Clipsync/ClipSync-Mac">🖥️ Mac 端</a>
 </p>
 
 ---
@@ -54,14 +54,14 @@
 docker run -d --name clipsync-server -p 8080:8080 \
   -v $(pwd)/config:/data/config:ro \
   -v $(pwd)/logs:/data/logs \
-  ghcr.io/gitwangjiahui/clipsync-server:latest
+  ghcr.io/jh-clipsync/clipsync-server:latest
 ```
 
 或用 compose。编排里 `name: clipsync` 固定了分组，`mysql` / `redis` / `clipsync`
 会挂在同一组下面。其中 `clipsync` 属于 `server` profile，**默认不启动**：
 
 ```bash
-git clone https://github.com/gitwangjiahui/ClipSync-Server.git
+git clone https://github.com/JH-Clipsync/ClipSync-Server.git
 cd ClipSync-Server
 cp .env.example .env                        # 改掉里面所有密码
 
@@ -89,7 +89,7 @@ MySQL / Redis 默认映射到宿主机 `3306` / `6379`，方便容器外的 serv
 
 ### 方式 2：下载二进制（免 Docker）
 
-到 [Releases](https://github.com/gitwangjiahui/ClipSync-Server/releases) 下载对应平台包：
+到 [Releases](https://github.com/JH-Clipsync/ClipSync-Server/releases) 下载对应平台包：
 
 | 包 | 适用 |
 |---|---|
