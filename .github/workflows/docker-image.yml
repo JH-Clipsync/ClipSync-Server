@@ -145,8 +145,9 @@ jobs:
 
             echo "==> 等待 3 秒后探测 28001 端口"
             sleep 3
-            if curl -fsS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:28001/ --max-time 5; then
-              echo "✅ 服务在 28001 端口正常响应"
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:28001/ --max-time 5 || echo "000")
+            if [ "$CODE" != "000" ]; then
+              echo "✅ 服务在 28001 端口正常响应（HTTP $CODE，根路径 404 属正常）"
             else
-              echo "⚠️ 28001 端口未正常响应，请检查容器日志：docker compose logs --tail=50 clipsync"
+              echo "⚠️ 28001 端口无响应，请检查容器日志：docker compose logs --tail=50 clipsync"
             fi
