@@ -211,11 +211,40 @@ func (h *Hub) broadcastPresence(userID int64) {
 	}
 }
 
+// Kick reason：客户端据此显示不同文案，并决定是否需要重连/改密码。
+const (
+	KickReasonPasswordReset = "password_reset" // 管理端重置了密码
+	KickReasonUserDisabled  = "user_disabled"  // 账号被封禁
+	KickReasonUserDeleted   = "user_deleted"   // 账号被删除
+	KickReasonDeviceKicked  = "device_kicked"  // 管理员主动踢该设备下线
+	KickReasonDeviceBanned  = "device_banned"  // 设备被禁用
+)
+
+// kickPayload 放进 server_kick 消息的 payload。reason 决定客户端提示语。
+type kickPayload struct {
+	Reason string `json:"reason"`
+}
+
+// sendKick 给单台连接发送 server_kick 消息并立即关闭连接。
+func sendKick(c *Client, reason string) {
+	body, _ := json.Marshal(kickPayload{Reason: reason})
+	kickMsg, _ := json.Marshal(Message{
+		ID:      "server_kick",
+		Type:    "server_kick",
+		From:    "server",
+		TS:      time.Now().UnixMilli(),
+		Payload: body,
+	})
+	_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = c.conn.WriteMessage(websocket.TextMessage, kickMsg)
+	_ = c.conn.Close()
+}
+
 // kickUser 强制断开 userID 下的所有连接。
 // 由管理端重置密码 / 封禁用户时触发。
 // 调用 Close() 会让 readPump 下一次 ReadMessage 返回错误，
 // defer 里自动走 unregister + 清理在线登记 + 关闭 writePump。
-func (h *Hub) kickUser(userID int64) int {
+func (h *Hub) kickUser(userID int64, reason string) int {
 	h.mu.RLock()
 	set := h.clients[userID]
 	targets := make([]*Client, 0, len(set))
@@ -229,20 +258,33 @@ func (h *Hub) kickUser(userID int64) int {
 		return 0
 	}
 	// 先发踢下线通知，客户端收到后主动断开并提示用户
-	kickMsg, _ := json.Marshal(Message{
-		ID:      "server_kick",
-		Type:    "server_kick",
-		From:    "server",
-		TS:      time.Now().UnixMilli(),
-		Payload: json.RawMessage(`{}`),
-	})
 	for _, c := range targets {
-		_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_ = c.conn.WriteMessage(websocket.TextMessage, kickMsg)
-		_ = c.conn.Close()
+		sendKick(c, reason)
 	}
-	logInfo("👟 强制下线 user=%d，断开 %d 台连接", userID, n)
+	logInfo("👟 强制下线 user=%d reason=%s，断开 %d 台连接", userID, reason, n)
 	return n
+}
+
+// kickDevice 只断开某用户下指定 deviceID 的连接，不影响该账号其他设备。
+// 返回实际断开的连接数（设备可能本就离线，返回 0 也算成功）。
+func (h *Hub) kickDevice(userID int64, deviceID, reason string) int {
+	h.mu.RLock()
+	set := h.clients[userID]
+	targets := make([]*Client, 0, 1)
+	for c := range set {
+		if c.deviceID == deviceID {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.RUnlock()
+
+	for _, c := range targets {
+		sendKick(c, reason)
+	}
+	if n := len(targets); n > 0 {
+		logInfo("👟 强制下线设备 user=%d device=%s reason=%s", userID, shortID(deviceID), reason)
+	}
+	return len(targets)
 }
 
 // shortID 只显示 device_id 前 8 位，日志更清爽
@@ -798,6 +840,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 设备准入：首次见到的设备自动建档；已被管理员禁用的设备直接拒绝升级。
+	deviceCtx, deviceCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	err = authService.EnsureDeviceAllowed(deviceCtx, userID, device, role, platform)
+	deviceCancel()
+	if err != nil {
+		logWarn("⚠ 拒绝连接: device=%s user=%d 设备已被禁用", shortID(device), userID)
+		http.Error(w, "设备已被管理员禁用", http.StatusForbidden)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logError("✗ WebSocket 升级失败: %v", err)
@@ -1100,23 +1152,50 @@ func main() {
 	// 过期会话清理：启动时跑一次，之后每小时一次
 	go purgeSessionsLoop(store)
 
-	// 管理端事件订阅：重置密码 / 封禁用户时强制下线所有连接
+	// 管理端事件订阅：重置密码 / 封禁用户 / 设备管理时触发
 	{
 		adminCtx, adminCancel := context.WithCancel(context.Background())
 		_ = adminCancel // 进程退出时随 HTTP Server 一起被回收
 		go func() {
 			backoff := 1 * time.Second
 			for {
-				err := cache.SubscribeKickUser(adminCtx, func(userID int64) {
-					// 额外清理会话：管理端重置密码后老 token 必须失效
+				err := cache.SubscribeAdminCommands(adminCtx, func(cmd AdminCommand) {
 					ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-					if th, err := cache.rdb.Get(ctx2, cache.userTokenKey(userID)).Result(); err == nil && th != "" {
-						_ = cache.DropToken(ctx2, th, userID)
+					defer cancel2()
+					switch cmd.Action {
+					case AdminActionKickUser:
+						// 踢整个账号：清会话 + 关闭所有连接
+						invalidateUserSessions(ctx2, cmd.UserID)
+						reason := cmd.Reason
+						if reason == "" {
+							reason = KickReasonPasswordReset
+						}
+						hub.kickUser(cmd.UserID, reason)
+					case AdminActionKickDevice:
+						if cmd.DeviceID != "" {
+							reason := cmd.Reason
+							if reason == "" {
+								reason = KickReasonDeviceKicked
+							}
+							hub.kickDevice(cmd.UserID, cmd.DeviceID, reason)
+						}
+					case AdminActionDisableDevice:
+						if cmd.DeviceID != "" {
+							if err := authService.SetDeviceStatus(ctx2, cmd.UserID, cmd.DeviceID, true); err != nil {
+								logWarn("⚠ 禁用设备失败 user=%d device=%s: %v",
+									cmd.UserID, shortID(cmd.DeviceID), err)
+								return
+							}
+							hub.kickDevice(cmd.UserID, cmd.DeviceID, KickReasonDeviceBanned)
+						}
+					case AdminActionEnableDevice:
+						if cmd.DeviceID != "" {
+							if err := authService.SetDeviceStatus(ctx2, cmd.UserID, cmd.DeviceID, false); err != nil {
+								logWarn("⚠ 解禁设备失败 user=%d device=%s: %v",
+									cmd.UserID, shortID(cmd.DeviceID), err)
+							}
+						}
 					}
-					_ = cache.DropPlainToken(ctx2, userID)
-					_ = store.DeleteSession(ctx2, userID)
-					cancel2()
-					hub.kickUser(userID)
 				})
 				// context 被取消：优雅退出
 				if adminCtx.Err() != nil {
@@ -1142,6 +1221,11 @@ func main() {
 	mux.HandleFunc("/auth/session", sessionHandler)
 	mux.HandleFunc("/auth/logout", logoutHandler)
 	mux.HandleFunc("/auth/change-password", changePasswordHandler)
+
+	// 管理端 HTTP 接口（走 admin_token 鉴权，与 Redis Pub/Sub 形成双保险）
+	mux.HandleFunc("GET /admin/users/{id}/devices", requireAdminToken(adminListDevices))
+	mux.HandleFunc("PUT /admin/users/{id}/devices/{deviceID}/status", requireAdminToken(adminSetDeviceStatus))
+	mux.HandleFunc("POST /admin/kick", requireAdminToken(adminKick))
 
 	srv := &http.Server{
 		Addr:         cfg.Server.Addr,

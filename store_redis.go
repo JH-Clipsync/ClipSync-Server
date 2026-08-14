@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -181,25 +183,88 @@ func (s *RedisStore) OnlineDevices(ctx context.Context, userID int64) (map[strin
 // 管理端（ClipSync-Admin）和服务端共享同一个 Redis 实例时，
 // 用 Pub/Sub 解耦跨服务通知。管理端是发布方，服务端是订阅方。
 //
-// 频道：{prefix}admin:kick_user （消息 = userID 十进制字符串）
-//   - 触发场景：管理端重置 C 端用户密码、封禁用户
-//   - 动作：hub.kickUser(userID) 关闭该用户所有 WebSocket 连接
+// 频道：{prefix}admin:kick_user
+// 消息体支持两种格式（订阅方都能解析）：
+//  1. 纯数字 userID（向后兼容）：等价于 {"user_id":id,"action":"kick_user"}
+//  2. JSON：AdminCommand
+//     - action=kick_user：踢该用户所有设备
+//     - action=kick_device：踢该用户指定 device_id 的设备
+//     - action=disable_device：禁用设备并踢它
+//     - action=enable_device：解禁设备（不影响在线连接）
+
+// AdminAction 管理端下发的控制动作
+type AdminAction string
+
+const (
+	AdminActionKickUser       AdminAction = "kick_user"
+	AdminActionKickDevice     AdminAction = "kick_device"
+	AdminActionDisableDevice  AdminAction = "disable_device"
+	AdminActionEnableDevice   AdminAction = "enable_device"
+)
+
+// AdminCommand 管理端通过 Redis/HTTP 发给 Server 的指令。
+type AdminCommand struct {
+	Action   AdminAction `json:"action"`
+	UserID   int64       `json:"user_id"`
+	DeviceID string      `json:"device_id,omitempty"`
+	Reason   string      `json:"reason,omitempty"`
+}
 
 // KickUserChannel 返回管理端强制下线的 Pub/Sub 频道名。
 func (s *RedisStore) KickUserChannel() string {
 	return s.prefix + "admin:kick_user"
 }
 
-// PublishKickUser 向管理端频道发布强制下线事件。
-// 由 ClipSync-Admin 调用；ClipSync-Server 自己是订阅方。
-func (s *RedisStore) PublishKickUser(ctx context.Context, userID int64) error {
-	return s.rdb.Publish(ctx, s.KickUserChannel(), fmt.Sprintf("%d", userID)).Err()
+// publishCommand 向管理端频道发布一条指令。
+func (s *RedisStore) publishCommand(ctx context.Context, cmd AdminCommand) error {
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("编码管理端指令失败: %w", err)
+	}
+	return s.rdb.Publish(ctx, s.KickUserChannel(), data).Err()
 }
 
-// SubscribeKickUser 订阅管理端强制下线事件，阻塞运行，
-// 每收到一次 userID 就调用回调。ctx 取消时退出。
+// PublishKickUser 向管理端频道发布"踢该用户所有设备"事件。
+// 由 ClipSync-Admin 调用；ClipSync-Server 自己在改密码时也会发。
+func (s *RedisStore) PublishKickUser(ctx context.Context, userID int64, reason string) error {
+	return s.publishCommand(ctx, AdminCommand{
+		Action: AdminActionKickUser,
+		UserID: userID,
+		Reason: reason,
+	})
+}
+
+// PublishKickDevice 向管理端频道发布"踢指定设备"事件。
+func (s *RedisStore) PublishKickDevice(ctx context.Context, userID int64, deviceID, reason string) error {
+	return s.publishCommand(ctx, AdminCommand{
+		Action:   AdminActionKickDevice,
+		UserID:   userID,
+		DeviceID: deviceID,
+		Reason:   reason,
+	})
+}
+
+// PublishDeviceStatus 向管理端频道发布"启用/禁用设备"事件。
+// 禁用时附带踢下线动作。
+func (s *RedisStore) PublishDeviceStatus(ctx context.Context, userID int64, deviceID string, disabled bool, reason string) error {
+	action := AdminActionEnableDevice
+	if disabled {
+		action = AdminActionDisableDevice
+	}
+	return s.publishCommand(ctx, AdminCommand{
+		Action:   action,
+		UserID:   userID,
+		DeviceID: deviceID,
+		Reason:   reason,
+	})
+}
+
+// SubscribeAdminCommands 订阅管理端控制事件，阻塞运行。
+// 每收到一条指令就调用 onCommand；ctx 取消时退出。
 // 重连由调用方负责，本方法内部不做无限重试。
-func (s *RedisStore) SubscribeKickUser(ctx context.Context, onKick func(userID int64)) error {
+//
+// 为了向后兼容，纯数字 userID 的消息会被翻译成 kick_user 指令。
+func (s *RedisStore) SubscribeAdminCommands(ctx context.Context, onCommand func(AdminCommand)) error {
 	sub := s.rdb.Subscribe(ctx, s.KickUserChannel())
 	defer sub.Close()
 	ch := sub.Channel()
@@ -211,11 +276,24 @@ func (s *RedisStore) SubscribeKickUser(ctx context.Context, onKick func(userID i
 			if !ok {
 				return nil
 			}
-			userID, err := strconv.ParseInt(msg.Payload, 10, 64)
-			if err != nil {
+			cmd, ok := parseAdminCommand(msg.Payload)
+			if !ok {
 				continue
 			}
-			onKick(userID)
+			onCommand(cmd)
 		}
 	}
+}
+
+// parseAdminCommand 解析管理端消息，支持 JSON 指令和纯数字 userID。
+func parseAdminCommand(payload string) (AdminCommand, bool) {
+	var cmd AdminCommand
+	if err := json.Unmarshal([]byte(payload), &cmd); err == nil && cmd.UserID > 0 && cmd.Action != "" {
+		return cmd, true
+	}
+	// 兼容旧格式：纯数字 userID
+	if userID, err := strconv.ParseInt(strings.TrimSpace(payload), 10, 64); err == nil && userID > 0 {
+		return AdminCommand{Action: AdminActionKickUser, UserID: userID, Reason: KickReasonPasswordReset}, true
+	}
+	return AdminCommand{}, false
 }

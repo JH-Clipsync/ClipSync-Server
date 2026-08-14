@@ -34,3 +34,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   KEY idx_sessions_expires (expires_at),
   CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 设备表：记录每个账号下出现过的设备，支持按设备禁用/解禁/踢下线。
+-- 同一账号下 device_id 唯一；首次握手自动建档，role/platform 以最新一次为准。
+CREATE TABLE IF NOT EXISTS devices (
+  user_id      BIGINT       NOT NULL,
+  device_id    VARCHAR(128) NOT NULL,
+  role         VARCHAR(16)  NOT NULL DEFAULT '',
+  platform     VARCHAR(32)  NOT NULL DEFAULT '',
+  disabled     TINYINT(1)   NOT NULL DEFAULT 0,
+  last_seen_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, device_id),
+  KEY idx_devices_user (user_id),
+  CONSTRAINT fk_devices_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

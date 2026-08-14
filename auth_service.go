@@ -64,6 +64,53 @@ func (a *AuthService) OnlineDevices(ctx context.Context, userID int64) (map[stri
 	return a.cache.OnlineDevices(ctx, userID)
 }
 
+// EnsureDeviceAllowed 在 WS 握手阶段调用：首次见到的设备自动建档，
+// 已被管理员禁用的设备直接返回 ErrDeviceDisabled，拒绝升级连接。
+//
+// role/platform 由客户端 query 上报，旧客户端没带 platform 时由 main 里
+// 的 platformFromDeviceID 兜底推断后再传进来。
+func (a *AuthService) EnsureDeviceAllowed(ctx context.Context, userID int64, deviceID, role, platform string) error {
+	if err := a.db.UpsertDevice(ctx, &Device{
+		UserID:   userID,
+		DeviceID: deviceID,
+		Role:     role,
+		Platform: platform,
+	}); err != nil {
+		// 建档失败不阻断连接：设备表只是管理能力，不能因此影响正常同步
+		logWarn("⚠ 设备建档失败 user=%d device=%s: %v", userID, shortID(deviceID), err)
+	}
+	disabled, err := a.db.IsDeviceDisabled(ctx, userID, deviceID)
+	if err != nil {
+		logWarn("⚠ 查询设备禁用状态失败 user=%d device=%s: %v", userID, shortID(deviceID), err)
+		return nil
+	}
+	if disabled {
+		return ErrDeviceDisabled
+	}
+	return nil
+}
+
+// ListDevices 列出用户所有登记过的设备（含离线）。供管理端接口使用。
+func (a *AuthService) ListDevices(ctx context.Context, userID int64) ([]*Device, error) {
+	return a.db.ListDevices(ctx, userID)
+}
+
+// SetDeviceStatus 启用/禁用指定账号下的一台设备。禁用一台设备只影响后续登录/握手，
+// 已经在线的连接由上层另外调用 Hub.kickDevice 立即踢掉。
+func (a *AuthService) SetDeviceStatus(ctx context.Context, userID int64, deviceID string, disabled bool) error {
+	return a.db.UpdateDeviceStatus(ctx, userID, deviceID, disabled)
+}
+
+// InvalidateSessions 清掉一个用户的 MySQL 会话与 Redis token 缓存，
+// 让该用户所有老 token 立即失效。管理端踢整个账号下线时调用。
+func (a *AuthService) InvalidateSessions(ctx context.Context, userID int64) {
+	if th, err := a.cache.rdb.Get(ctx, a.cache.userTokenKey(userID)).Result(); err == nil && th != "" {
+		_ = a.cache.DropToken(ctx, th, userID)
+	}
+	_ = a.cache.DropPlainToken(ctx, userID)
+	_ = a.db.DeleteSession(ctx, userID)
+}
+
 // LoginResult 登录接口的返回信息。
 type LoginResult struct {
 	Token     string
@@ -283,7 +330,7 @@ func (a *AuthService) ChangePassword(ctx context.Context, token, oldPassword, ne
 	_ = a.cache.DropToken(ctx, oldHash, userID)
 	_ = a.cache.DropPlainToken(ctx, userID)
 	// 踢掉所有在线连接，让它们立即断开
-	_ = a.cache.PublishKickUser(ctx, userID)
+	_ = a.cache.PublishKickUser(ctx, userID, KickReasonPasswordReset)
 
 	// 签发新 token 返回给调用方
 	ttl := time.Duration(a.cfg.TokenTTLHours) * time.Hour

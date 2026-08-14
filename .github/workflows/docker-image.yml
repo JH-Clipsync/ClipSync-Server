@@ -1,7 +1,9 @@
-name: Publish Docker Image
+name: Build & Deploy
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -14,6 +16,9 @@ jobs:
   docker:
     name: Build & Push multi-arch image
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.pick_tag.outputs.version_tag }}
+      owner_lc: ${{ steps.owner.outputs.owner_lc }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,11 +46,20 @@ jobs:
         with:
           images: ghcr.io/${{ steps.owner.outputs.owner_lc }}/clipsync-server
           tags: |
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: 决定部署用的镜像 tag（main=latest，tag=版本号）
+        id: pick_tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version_tag=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            echo "version_tag=latest" >> $GITHUB_OUTPUT
+          fi
 
       - name: 从 git ref 提取版本号
         id: version
@@ -70,3 +84,46 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to server
+    runs-on: ubuntu-latest
+    needs: docker
+    # main 推送、tag、手动触发都部署
+    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: 部署到远程服务器（拉镜像 + 重启容器）
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            IMAGE_TAG="${{ needs.docker.outputs.image_tag }}"
+            GHCR_USER="${{ github.actor }}"
+            GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+
+            echo "==> 登录 GHCR"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            echo "==> 进入部署目录 /app/ClipSync/server"
+            cd /app/ClipSync/server
+
+            echo "==> 写入本次部署镜像 tag（docker-compose 读取 .env）"
+            touch .env
+            sed -i '/^IMAGE_TAG=/d' .env || true
+            echo "IMAGE_TAG=$IMAGE_TAG" >> .env
+
+            echo "==> 拉取镜像 ghcr.io/${{ needs.docker.outputs.owner_lc }}/clipsync-server:$IMAGE_TAG"
+            docker compose pull clipsync
+
+            echo "==> 重建并启动容器"
+            docker compose up -d --remove-orphans
+
+            echo "==> 清理悬空镜像"
+            docker image prune -f || true
+
+            echo "==> 当前容器状态"
+            docker compose ps

@@ -104,6 +104,10 @@ func (s *MySQLStore) migrate(ctx context.Context) error {
 			return fmt.Errorf("初始化表结构失败: %w", err)
 		}
 	}
+	// devices 表单独建，方便后续扩展
+	if err := s.migrateDevices(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 

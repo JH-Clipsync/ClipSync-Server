@@ -72,6 +72,10 @@ type ServerConfig struct {
 
 	// TrustProxy 是否信任反代头（X-Forwarded-For / X-Real-IP），启用后才能正确拿到真实 IP
 	TrustProxy bool `yaml:"trust_proxy"`
+
+	// AdminToken 管理端通过 HTTP 调用 /admin/* 接口（kick、设备禁用等）时携带的
+	// Bearer Token。留空则 /admin/* 接口一律返回 401，避免未授权访问。
+	AdminToken string `yaml:"admin_token"`
 }
 
 // LogsConfig 日志相关
