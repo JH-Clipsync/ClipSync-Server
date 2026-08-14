@@ -2,8 +2,6 @@ name: Build & Deploy
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -46,13 +44,13 @@ jobs:
         with:
           images: ghcr.io/${{ steps.owner.outputs.owner_lc }}/clipsync-server
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: 决定部署用的镜像 tag（main=latest，tag=版本号）
+      - name: 决定部署用的镜像 tag（tag=版本号，手动触发=latest）
         id: pick_tag
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
@@ -89,8 +87,8 @@ jobs:
     name: Deploy to server
     runs-on: ubuntu-latest
     needs: docker
-    # main 推送、tag、手动触发都部署
-    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+    # tag 推送或手动触发才部署
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
     steps:
       - name: 部署到远程服务器（拉镜像 + 重启容器）
         uses: appleboy/ssh-action@v1.2.0
