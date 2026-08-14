@@ -19,7 +19,7 @@
 #   #   FLUSH PRIVILEGES;
 
 server:
-  addr: ":8080"
+  addr: ":28001"
   read_timeout: 15s
   write_timeout: 15s
   shutdown_timeout: 10s

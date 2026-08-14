@@ -42,7 +42,7 @@ COPY --from=builder /out/clipsync-server /app/clipsync-server
 COPY --from=builder /src/config.default.yaml /app/config.default.yaml
 
 # 暴露端口（与 config.yaml 默认值保持一致；docker run -p 可覆盖）
-EXPOSE 8080
+EXPOSE 28001
 
 # 数据 / 日志 / 配置目录（容器里用 volume 挂到这里就能持久化）
 VOLUME ["/data/logs", "/data/store"]

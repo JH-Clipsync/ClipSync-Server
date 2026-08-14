@@ -7,8 +7,8 @@
 # 想改配置改 config.yaml 就行，不用动这里；这里只是"什么都不填时长什么样"。
 
 server:
-  # 监听地址，":8080" 表示所有网卡
-  addr: ":8080"
+  # 监听地址，":28001" 表示所有网卡
+  addr: ":28001"
   # HTTP 读 / 写超时，支持 Go duration 字符串（"15s" / "1m"）
   read_timeout: 15s
   write_timeout: 15s

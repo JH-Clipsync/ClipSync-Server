@@ -17,7 +17,7 @@ func TestDefaultConfigParses(t *testing.T) {
 		got  any
 		want any
 	}{
-		{"server.addr", cfg.Server.Addr, ":8080"},
+		{"server.addr", cfg.Server.Addr, ":28001"},
 		{"server.read_timeout", cfg.Server.ReadTimeout, 15 * time.Second},
 		{"server.shutdown_timeout", cfg.Server.ShutdownTimeout, 10 * time.Second},
 		{"logs.dir", cfg.Logs.Dir, "logs"},
@@ -92,8 +92,8 @@ e2ee:
 	if cfg.Redis.KeyPrefix != "clipsync:" {
 		t.Errorf("redis.key_prefix 应保留默认值，实际 %q", cfg.Redis.KeyPrefix)
 	}
-	if cfg.Server.Addr != ":8080" {
-		t.Errorf("server.addr 应保留默认 :8080，实际 %q", cfg.Server.Addr)
+	if cfg.Server.Addr != ":28001" {
+		t.Errorf("server.addr 应保留默认 :28001，实际 %q", cfg.Server.Addr)
 	}
 }
 

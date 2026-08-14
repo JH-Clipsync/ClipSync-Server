@@ -58,7 +58,7 @@ type Config struct {
 
 // ServerConfig HTTP 服务监听
 type ServerConfig struct {
-	// Addr 监听地址，例如 ":8080" 或 "0.0.0.0:9000"
+	// Addr 监听地址，例如 ":28001" 或 "0.0.0.0:9000"
 	Addr string `yaml:"addr"`
 
 	// ReadTimeout HTTP 读超时

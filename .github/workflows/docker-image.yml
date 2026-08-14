@@ -114,6 +114,20 @@ jobs:
             sed -i '/^IMAGE_TAG=/d' .env || true
             echo "IMAGE_TAG=$IMAGE_TAG" >> .env
 
+            echo "==> 确保 config/config.yaml 监听端口为 28001"
+            if [ -f config/config.yaml ]; then
+              if grep -qE '^\s*addr:\s*":8080"' config/config.yaml; then
+                sed -i -E 's|^(\s*addr:\s*)":8080"|\1":28001"|' config/config.yaml
+                echo "已将 server.addr 从 :8080 改为 :28001"
+              elif grep -qE '^\s*addr:\s*":28001"' config/config.yaml; then
+                echo "server.addr 已是 :28001，无需修改"
+              else
+                echo "⚠️ config/config.yaml 中未找到 :8080/:28001 形式的 server.addr，请手动确认监听端口"
+              fi
+            else
+              echo "⚠️ 未找到 config/config.yaml，容器将使用内置默认端口 :28001"
+            fi
+
             echo "==> 拉取镜像 ghcr.io/${{ needs.docker.outputs.owner_lc }}/clipsync-server:$IMAGE_TAG"
             docker compose pull clipsync
 
