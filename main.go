@@ -84,6 +84,15 @@ type Client struct {
 
 	// onlineAt 连接建立的时间，用于在线设备列表展示
 	onlineAt time.Time
+
+	// platform 客户端平台：mac / windows / android / ios / linux / unknown
+	platform string
+	// caps 客户端能力/同步开关状态，由握手 query 上报，原样下发给同组其他端展示。
+	// 约定：
+	//   clip_up  = 本机剪贴板变化会自动上行
+	//   sms_in   = 本机短信会同步上行（通常只有 Android 有）
+	//   auto_put = 收到远端剪贴板会自动写入本机剪贴板
+	caps map[string]bool
 }
 
 // globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
@@ -141,11 +150,13 @@ func (h *Hub) unregister(c *Client) {
 
 // onlineDevice 在线列表里的单台设备信息，序列化成 presence 消息 payload。
 type onlineDevice struct {
-	DeviceID string `json:"device_id"`
-	Role     string `json:"role"`
-	IP       string `json:"ip"`
-	OnlineAt int64  `json:"online_at"` // 毫秒时间戳
-	Self     bool   `json:"self"`      // 是否为接收这条消息的设备本身
+	DeviceID string         `json:"device_id"`
+	Role     string         `json:"role"`
+	Platform string         `json:"platform"`
+	IP       string         `json:"ip"`
+	OnlineAt int64          `json:"online_at"` // 毫秒时间戳
+	Self     bool           `json:"self"`      // 是否为接收这条消息的设备本身
+	Caps     map[string]bool `json:"caps"`     // 客户端能力/同步开关
 }
 
 // snapshotDevices 在持锁状态下拷贝某用户的在线设备列表，避免遍历时并发修改。
@@ -174,9 +185,11 @@ func (h *Hub) broadcastPresence(userID int64) {
 			devices = append(devices, onlineDevice{
 				DeviceID: other.deviceID,
 				Role:     other.role,
+				Platform: other.platform,
 				IP:       other.ip,
 				OnlineAt: other.onlineAt.UnixMilli(),
 				Self:     other == c,
+				Caps:     other.caps,
 			})
 		}
 		h.mu.RUnlock()
@@ -271,6 +284,51 @@ func extractIP(r *http.Request) string {
 		return addr[:i]
 	}
 	return addr
+}
+
+// platformFromDeviceID 在客户端未显式上报 platform 时，根据 deviceID 前缀兜底推断平台。
+func platformFromDeviceID(deviceID string) string {
+	low := strings.ToLower(deviceID)
+	switch {
+	case strings.HasPrefix(low, "mac-"):
+		return "mac"
+	case strings.HasPrefix(low, "win-"):
+		return "windows"
+	case strings.HasPrefix(low, "android-"):
+		return "android"
+	case strings.HasPrefix(low, "ios-"):
+		return "ios"
+	case strings.HasPrefix(low, "linux-"):
+		return "linux"
+	default:
+		return "unknown"
+	}
+}
+
+// parseCaps 把握手 query 里 "clip_up,sms_in,auto_put" 解析成 map，用于 presence 展示。
+// 形如 "clip_up=0,sms_in=1" 的形式也支持；默认出现即为开启。
+func parseCaps(raw string) map[string]bool {
+	m := make(map[string]bool)
+	if raw == "" {
+		return m
+	}
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		// 支持 key=0/1 的写法
+		if i := strings.IndexByte(item, '='); i >= 0 {
+			key := strings.TrimSpace(item[:i])
+			val := strings.TrimSpace(item[i+1:])
+			if key != "" {
+				m[key] = val != "0" && val != "false"
+			}
+			continue
+		}
+		m[item] = true
+	}
+	return m
 }
 
 // pushTargetLabel 把内部路由角色转成日志里更易读的推送范围标签
@@ -703,9 +761,10 @@ func (c *Client) writePump() {
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	device := r.URL.Query().Get("device")
-	role := r.URL.Query().Get("role")
+	q := r.URL.Query()
+	token := q.Get("token")
+	device := q.Get("device")
+	role := q.Get("role")
 	// role 决定路由，只允许 pc / mobile；兼容旧值 phone
 	switch role {
 	case RolePC:
@@ -715,6 +774,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		role = RolePC // 默认 pc（保守：能收到 notify_pc）
 	}
+
+	// platform：客户端平台。旧客户端不上报则根据 deviceID 前缀兜底推断。
+	platform := q.Get("platform")
+	if platform == "" {
+		platform = platformFromDeviceID(device)
+	}
+	// caps：客户端同步能力/开关，逗号分隔，如 "clip_up,sms_in,auto_put"
+	caps := parseCaps(q.Get("caps"))
 
 	if token == "" || device == "" {
 		http.Error(w, "参数错误: 需要 token 和 device", http.StatusBadRequest)
@@ -749,6 +816,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		send:     make(chan []byte, sendQueue),
 		userID:   userID,
 		onlineAt: time.Now(),
+		platform: platform,
+		caps:     caps,
 	}
 
 	// Redis 在线登记：登录接口靠它判断"当前用户是否已有客户端登录"
