@@ -27,6 +27,11 @@ const (
 
 	// 剪贴板类：广播给所有端；接收方按开关决定是否自动写入本机剪贴板
 	TypeClipboard = "clipboard"
+
+	// presence 在线设备列表变更通知：服务端在客户端上下线时主动推给同组所有连接，
+	// payload 形如 {"devices":[{"device_id","role","ip","online_at","self"}]}。
+	// 客户端据此实时刷新"在线设备"UI。
+	TypePresence = "presence"
 )
 
 // version 在编译时通过 -ldflags 注入：
@@ -76,6 +81,9 @@ type Client struct {
 	// userID 鉴权后的账号 ID。同一账号的所有设备共享一个分组，
 	// 取代改造前"按 token 字符串分组"的做法。
 	userID int64
+
+	// onlineAt 连接建立的时间，用于在线设备列表展示
+	onlineAt time.Time
 }
 
 // globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
@@ -104,18 +112,19 @@ var upgrader = websocket.Upgrader{
 
 func (h *Hub) register(c *Client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if _, ok := h.clients[c.userID]; !ok {
 		h.clients[c.userID] = make(map[*Client]bool)
 	}
 	h.clients[c.userID][c] = true
 	logInfo("🟢 上线: %s (%s) user=%d token=%s ip=%s — 该组在线 %d 台",
 		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip, len(h.clients[c.userID]))
+	h.mu.Unlock()
+	// 上线后向该组所有连接广播最新在线列表
+	h.broadcastPresence(c.userID)
 }
 
 func (h *Hub) unregister(c *Client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if set, ok := h.clients[c.userID]; ok {
 		delete(set, c)
 		if len(set) == 0 {
@@ -125,6 +134,68 @@ func (h *Hub) unregister(c *Client) {
 	close(c.send)
 	logInfo("⚪ 下线: %s (%s) user=%d token=%s ip=%s",
 		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
+	h.mu.Unlock()
+	// 下线后向该组剩余连接广播最新在线列表
+	h.broadcastPresence(c.userID)
+}
+
+// onlineDevice 在线列表里的单台设备信息，序列化成 presence 消息 payload。
+type onlineDevice struct {
+	DeviceID string `json:"device_id"`
+	Role     string `json:"role"`
+	IP       string `json:"ip"`
+	OnlineAt int64  `json:"online_at"` // 毫秒时间戳
+	Self     bool   `json:"self"`      // 是否为接收这条消息的设备本身
+}
+
+// snapshotDevices 在持锁状态下拷贝某用户的在线设备列表，避免遍历时并发修改。
+func (h *Hub) snapshotDevicesLocked(userID int64) []*Client {
+	set := h.clients[userID]
+	list := make([]*Client, 0, len(set))
+	for c := range set {
+		list = append(list, c)
+	}
+	return list
+}
+
+// broadcastPresence 把某账号当前的在线设备列表推给该组所有连接。
+// 在 register/unregister 后调用，让客户端实时刷新"在线设备"UI。
+func (h *Hub) broadcastPresence(userID int64) {
+	h.mu.RLock()
+	targets := h.snapshotDevicesLocked(userID)
+	h.mu.RUnlock()
+	if len(targets) == 0 {
+		return
+	}
+	for _, c := range targets {
+		h.mu.RLock()
+		devices := make([]onlineDevice, 0, len(h.clients[userID]))
+		for other := range h.clients[userID] {
+			devices = append(devices, onlineDevice{
+				DeviceID: other.deviceID,
+				Role:     other.role,
+				IP:       other.ip,
+				OnlineAt: other.onlineAt.UnixMilli(),
+				Self:     other == c,
+			})
+		}
+		h.mu.RUnlock()
+		payload, _ := json.Marshal(map[string]any{
+			"devices": devices,
+		})
+		msg, _ := json.Marshal(Message{
+			ID:      "presence",
+			Type:    TypePresence,
+			From:    "server",
+			TS:      time.Now().UnixMilli(),
+			Payload: payload,
+		})
+		select {
+		case c.send <- msg:
+		default:
+			logWarn("⚠ presence 推送丢弃：%s 队列已满", shortID(c.deviceID))
+		}
+	}
 }
 
 // kickUser 强制断开 userID 下的所有连接。
@@ -378,6 +449,13 @@ func (c *Client) readPump() {
 		}
 		// 强制覆盖 from，防止客户端伪造
 		msg.From = c.deviceID
+
+		// 忽略客户端发来的控制消息（心跳、伪造的 presence），不转发也不记录
+		// Windows 端会发应用层 {"type":"ping"} 心跳；presence 只允许服务端下发
+		switch msg.Type {
+		case "ping", "pong", TypePresence:
+			continue
+		}
 
 		// 加密策略闸门：识别密文 / 按配置拒绝明文
 		encrypted, encErr := checkEncryption(msg.Payload)
@@ -670,6 +748,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		ip:       extractIP(r),
 		send:     make(chan []byte, sendQueue),
 		userID:   userID,
+		onlineAt: time.Now(),
 	}
 
 	// Redis 在线登记：登录接口靠它判断"当前用户是否已有客户端登录"
