@@ -169,6 +169,22 @@ func (h *Hub) snapshotDevicesLocked(userID int64) []*Client {
 	return list
 }
 
+// onlineDeviceIDs 返回某用户当前在内存 hub 中的在线 deviceID 集合。
+// 这是最权威的在线状态——连接在就一定在，连接不在就不在。
+func (h *Hub) onlineDeviceIDs(userID int64) map[string]struct{} {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	set, ok := h.clients[userID]
+	if !ok {
+		return nil
+	}
+	m := make(map[string]struct{}, len(set))
+	for c := range set {
+		m[c.deviceID] = struct{}{}
+	}
+	return m
+}
+
 // broadcastPresence 把某账号当前的在线设备列表推给该组所有连接。
 // 在 register/unregister 后调用，让客户端实时刷新"在线设备"UI。
 func (h *Hub) broadcastPresence(userID int64) {
@@ -903,6 +919,8 @@ func onlineTTLDuration() time.Duration {
 }
 
 // keepOnline 定期给 Redis 在线登记续期，周期取 TTL 的三分之一。
+// 用 MarkOnline（HSet+Expire）而非 TouchOnline（仅 Expire），
+// 确保初次 MarkOnline 失败时心跳能补上 field，不会出现"内存在线但 Redis 缺失"。
 // 连接断开时 c.send 被关闭，这里随之退出。
 func (c *Client) keepOnline(ttl time.Duration) {
 	interval := ttl / 3
@@ -919,7 +937,7 @@ func (c *Client) keepOnline(ttl time.Duration) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := authGate.TouchOnline(ctx, c.userID, ttl); err != nil {
+		if err := authGate.MarkOnline(ctx, c.userID, c.deviceID, c.role, ttl); err != nil {
 			logDebug("在线登记续期失败: %v", err)
 		}
 		cancel()

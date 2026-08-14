@@ -61,10 +61,17 @@ func adminListDevices(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	online, _ := authService.OnlineDevices(ctx, userID)
+	// 在线状态以内存 hub 为准（真实 WebSocket 连接），Redis 仅作补充
+	memOnline := hub.onlineDeviceIDs(userID)
+	redisOnline, _ := authService.OnlineDevices(ctx, userID)
 	out := make([]adminDeviceResponse, 0, len(list))
 	for _, d := range list {
-		_, isOnline := online[d.DeviceID]
+		_, isOnline := memOnline[d.DeviceID]
+		if !isOnline && redisOnline != nil {
+			if _, ok := redisOnline[d.DeviceID]; ok {
+				isOnline = true
+			}
+		}
 		out = append(out, adminDeviceResponse{
 			UserID:     d.UserID,
 			DeviceID:   d.DeviceID,
