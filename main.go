@@ -87,6 +87,8 @@ type Client struct {
 
 	// platform 客户端平台：mac / windows / android / ios / linux / unknown
 	platform string
+	// name 客户端自定义设备名，由用户在端上设置，存在服务端，原样下发展示。
+	name string
 	// caps 客户端能力/同步开关状态，由握手 query 上报，原样下发给同组其他端展示。
 	// 约定：
 	//   clip_up  = 本机剪贴板变化会自动上行
@@ -153,6 +155,7 @@ type onlineDevice struct {
 	DeviceID string         `json:"device_id"`
 	Role     string         `json:"role"`
 	Platform string         `json:"platform"`
+	Name     string         `json:"name"`
 	IP       string         `json:"ip"`
 	OnlineAt int64          `json:"online_at"` // 毫秒时间戳
 	Self     bool           `json:"self"`      // 是否为接收这条消息的设备本身
@@ -185,6 +188,19 @@ func (h *Hub) onlineDeviceIDs(userID int64) map[string]struct{} {
 	return m
 }
 
+// renameDevice 更新某账号下指定设备所有在线连接的自定义名称，并广播 presence，
+// 让该账号所有端实时看到新名称（包括改名设备自身）。
+func (h *Hub) renameDevice(userID int64, deviceID, name string) {
+	h.mu.Lock()
+	for c := range h.clients[userID] {
+		if c.deviceID == deviceID {
+			c.name = name
+		}
+	}
+	h.mu.Unlock()
+	h.broadcastPresence(userID)
+}
+
 // broadcastPresence 把某账号当前的在线设备列表推给该组所有连接。
 // 在 register/unregister 后调用，让客户端实时刷新"在线设备"UI。
 func (h *Hub) broadcastPresence(userID int64) {
@@ -202,6 +218,7 @@ func (h *Hub) broadcastPresence(userID int64) {
 				DeviceID: other.deviceID,
 				Role:     other.role,
 				Platform: other.platform,
+				Name:     other.name,
 				IP:       other.ip,
 				OnlineAt: other.onlineAt.UnixMilli(),
 				Self:     other == c,
@@ -866,6 +883,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 加载该设备的自定义名称（用户在端上设置过则有值）
+	nameCtx, nameCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	deviceName, _ := authService.GetDeviceName(nameCtx, userID, device)
+	nameCancel()
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logError("✗ WebSocket 升级失败: %v", err)
@@ -885,6 +907,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		userID:   userID,
 		onlineAt: time.Now(),
 		platform: platform,
+		name:     deviceName,
 		caps:     caps,
 	}
 
@@ -1244,6 +1267,9 @@ func main() {
 	mux.HandleFunc("GET /admin/users/{id}/devices", requireAdminToken(adminListDevices))
 	mux.HandleFunc("PUT /admin/users/{id}/devices/{deviceID}/status", requireAdminToken(adminSetDeviceStatus))
 	mux.HandleFunc("POST /admin/kick", requireAdminToken(adminKick))
+
+	// 普通用户 HTTP 接口（走登录 token 鉴权）
+	mux.HandleFunc("POST /device/name", requireUserToken(handleRenameDevice))
 
 	srv := &http.Server{
 		Addr:         cfg.Server.Addr,

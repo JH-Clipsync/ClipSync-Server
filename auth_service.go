@@ -101,6 +101,16 @@ func (a *AuthService) SetDeviceStatus(ctx context.Context, userID int64, deviceI
 	return a.db.UpdateDeviceStatus(ctx, userID, deviceID, disabled)
 }
 
+// GetDeviceName 查询某设备的自定义名称，不存在返回空串。
+func (a *AuthService) GetDeviceName(ctx context.Context, userID int64, deviceID string) (string, error) {
+	return a.db.GetDeviceName(ctx, userID, deviceID)
+}
+
+// UpdateDeviceName 更新某账号下一台设备的自定义名称。
+func (a *AuthService) UpdateDeviceName(ctx context.Context, userID int64, deviceID, name string) error {
+	return a.db.UpdateDeviceName(ctx, userID, deviceID, name)
+}
+
 // InvalidateSessions 清掉一个用户的 MySQL 会话与 Redis token 缓存，
 // 让该用户所有老 token 立即失效。管理端踢整个账号下线时调用。
 func (a *AuthService) InvalidateSessions(ctx context.Context, userID int64) {
