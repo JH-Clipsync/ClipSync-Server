@@ -215,7 +215,8 @@ func adminSetDeviceStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	// 禁用：立刻踢这台设备下线；解禁：不动当前连接（让它继续工作）
+	// 禁用成功后主动踢这台设备下线；解禁不动当前连接。
+	// 即使踢连接失败，设备下次重连握手时也会因 disabled=true 被拒。
 	if body.Disabled {
 		hub.kickDevice(userID, deviceID, KickReasonDeviceBanned)
 	}
@@ -223,9 +224,11 @@ func adminSetDeviceStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminKick POST /server-admin/kick
-// 兼容两种 body：
-//  1. {"user_id":123}                   踢用户所有设备
-//  2. {"user_id":123,"device_id":"xx"}  只踢该设备
+// 统一入口，支持 Admin 通过 HTTP 兜底下发的所有管理动作：
+//   - kick_user / 空 action：踢用户所有设备下线
+//   - kick_device：踢单台设备下线
+//   - disable_device：禁用设备（先改库，成功后踢下线）
+//   - enable_device：解禁设备（只改库，不踢连接）
 func adminKick(w http.ResponseWriter, r *http.Request) {
 	var cmd AdminCommand
 	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil || cmd.UserID <= 0 {
@@ -237,10 +240,43 @@ func adminKick(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	switch {
-	case cmd.DeviceID != "":
+
+	switch cmd.Action {
+	case AdminActionDisableDevice:
+		if cmd.DeviceID == "" {
+			http.Error(w, "缺少 device_id", http.StatusBadRequest)
+			return
+		}
+		if err := authService.SetDeviceStatus(ctx, cmd.UserID, cmd.DeviceID, true); err != nil {
+			if errors.Is(err, ErrDeviceNotFound) {
+				http.Error(w, "设备不存在", http.StatusNotFound)
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		hub.kickDevice(cmd.UserID, cmd.DeviceID, KickReasonDeviceBanned)
+	case AdminActionEnableDevice:
+		if cmd.DeviceID == "" {
+			http.Error(w, "缺少 device_id", http.StatusBadRequest)
+			return
+		}
+		if err := authService.SetDeviceStatus(ctx, cmd.UserID, cmd.DeviceID, false); err != nil {
+			if errors.Is(err, ErrDeviceNotFound) {
+				http.Error(w, "设备不存在", http.StatusNotFound)
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+	case AdminActionKickDevice:
+		if cmd.DeviceID == "" {
+			http.Error(w, "缺少 device_id", http.StatusBadRequest)
+			return
+		}
 		hub.kickDevice(cmd.UserID, cmd.DeviceID, cmd.Reason)
 	default:
+		// 兼容旧版 body（不带 action）或 kick_user：踢整个账号
 		invalidateUserSessions(ctx, cmd.UserID)
 		hub.kickUser(cmd.UserID, cmd.Reason)
 	}
