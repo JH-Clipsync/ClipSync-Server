@@ -62,8 +62,14 @@ func (s *MySQLStore) migrateDevices(ctx context.Context) error {
 	return nil
 }
 
-// UpsertDevice 登录/握手时登记一台设备。role/platform/name/last_ip 以最新一次为准。
-// disabled 保持库里的现值，不会因为再次上线而自动解禁。
+// UpsertDevice 登录/握手时登记一台设备。
+//
+// 字段更新策略：
+//   - role/platform/last_ip/last_seen_at：以最新一次握手为准；
+//   - name：仅首次建档（INSERT）时写入客户端上报值；已存在的记录不会被握手阶段
+//     上报的 name 覆盖，避免把管理员/用户通过重命名接口设置的名称冲掉。
+//     改名只能走显式的 UpdateDeviceName 接口；
+//   - disabled：保持库里的现值，不会因为再次上线而自动解禁。
 func (s *MySQLStore) UpsertDevice(ctx context.Context, d *Device) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO devices (user_id, device_id, role, platform, name, last_ip, disabled, last_seen_at, created_at)
@@ -71,7 +77,6 @@ func (s *MySQLStore) UpsertDevice(ctx context.Context, d *Device) error {
 		ON DUPLICATE KEY UPDATE
 			role = VALUES(role),
 			platform = VALUES(platform),
-			name = IF(VALUES(name) = '', name, VALUES(name)),
 			last_ip = VALUES(last_ip),
 			last_seen_at = NOW()`,
 		d.UserID, d.DeviceID, d.Role, d.Platform, d.Name, d.LastIP)
