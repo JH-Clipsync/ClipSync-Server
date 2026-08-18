@@ -901,11 +901,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 加载该设备的自定义名称（如果客户端没上报，用库里已有的）
-	if name == "" {
-		nameCtx, nameCancel := context.WithTimeout(r.Context(), 5*time.Second)
-		name, _ = authService.GetDeviceName(nameCtx, userID, device)
-		nameCancel()
+	// 设备名优先级：以数据库里的自定义名为权威来源，避免客户端重连时用系统主机名
+	// 把用户通过重命名接口设置的名字覆盖回去。
+	// - 库里有名字：用库里的（用户已自定义）；
+	// - 库里没名字（首次建档）：用客户端上报的 name，作为初始值。
+	// 注意：EnsureDeviceAllowed 里的 UpsertDevice 只在 INSERT 时写 name，
+	// 已存在记录不会被覆盖，所以这里读到的一定是用户最终设置的名字。
+	nameCtx, nameCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	dbName, _ := authService.GetDeviceName(nameCtx, userID, device)
+	nameCancel()
+	if strings.TrimSpace(dbName) != "" {
+		name = dbName
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
