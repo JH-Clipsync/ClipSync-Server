@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="icon.png" width="128" alt="ClipSync ロゴ"/>
+  <img src="icon.png" width="128" alt="ClipSync アイコン"/>
 </p>
 
 <h1 align="center">ClipSync-Server</h1>
 
 <p align="center">
-  <b>ClipSync クロスデバイス同期システムの中継サーバー</b><br/>
+  <b>ClipSync 3端末同期システムのリレーサーバー</b><br/>
   <a href="README.md">简体中文</a> ·
   <a href="README.en.md">English</a> ·
   <a href="README.ja.md">日本語</a>
@@ -13,220 +13,298 @@
 
 ---
 
-ClipSync-Server は、セルフホスト型 ClipSync メッセージ同期システムのコア中継サーバーで、**Go + gorilla/websocket + MySQL + Redis** で構築されています。スマートフォンが受信した**SMS認証コード**やコピーした**テキスト/画像**をリアルタイムで PC クライアントへ転送し、その逆も行います。
+ClipSync-Server は、ClipSync のセルフホスト型クロスデバイスメッセージ同期システムの中核となるリレーサービスです。**Go + gorilla/websocket + MySQL + Redis** で開発されています。スマートフォンが受信した**SMS認証コード**やコピーした**テキスト/画像**を PC へリアルタイムに転送し、その逆も行います。
 
-サードパーティのプッシュサービスには依存せず、すべての通信はあなた自身の WebSocket エンドポイントを経由します。エンドツーエンド暗号化も任意で有効化でき、データはあなたの管理下に置かれます。
+サードパーティのプッシュサービスには一切依存せず、すべてのトラフィックは専用の WebSocket チャネルを通ります。エンドツーエンド暗号化は任意で、プライバシーはユーザー自身が管理できます。デフォルトでは **28001** ポートで待ち受けます。
 
 ---
 
 ## ✨ 主な機能
 
-| 分類 | 内容 |
-|------|------|
-| 🔄 **リアルタイム WebSocket 中継** | `userID` 単位でルーティング。`notify_pc` / `notify_mobile` / `notify_all` / `clipboard` の4種類の配送セマンティクス。`pc` と `mobile` ロール間で相互に配送 |
-| 👥 **オンライン端末管理** | メモリ上の Hub が実際の WebSocket 接続を権威的に管理。Redis Hash（`clipsync:online:<userID>`、TTL 90秒）で在席状況を記録し、プロセスが kill されても自然に失効 |
-| 📡 **プレゼンスプッシュ** | 端末の接続/切断時に同グループの全接続へ `presence` メッセージをブロードキャストし、クライアントのオンライン端末 UI（プラットフォーム/IP/機能/カスタム名）をリアルタイム更新 |
-| 👤 **ユーザーシステム** | 登録/ログイン、scrypt パスワードハッシュ（N=32768, r=8, p=1）、JWT 形式トークン、設定可能な TTL（デフォルト30日）、IP 単位のログインレート制限 |
-| 📱 **端末テーブル管理** | `devices` テーブルに各アカウントの端末（ロール/プラットフォーム/カスタム名/最終 IP）を永続化。管理者による**端末の無効化**に対応し、無効化後はハンドシェイクを拒否 |
-| 👟 **強制切断** | ユーザー全端末または単一端末をキック可能。パスワードリセット/ユーザー凍結/ユーザー削除時に連動。5種類の kick reason（password_reset / user_disabled / user_deleted / device_kicked / device_banned） |
-| 🛡️ **管理 API** | `GET /server-admin/users/{id}/devices`（オンライン状態はメモリ Hub 準拠）、端末の有効/無効/リネーム、全ユーザー横断のページング検索、統一エントリ `POST /server-admin/kick`。Bearer トークン認証（定数時間比較） |
-| 📨 **Redis Pub/Sub 連携** | ClipSync-Admin と Redis を共有する場合、チャネル `clipsync:admin:kick_user` 経由で制御コマンドを配信。HTTP API をフォールバックとして二重化 |
-| 🧹 **SMS ペイロード整形** | `【+86xxx】` / `[N件]` プレフィックスを除去、11桁の送信者番号を `sender` に抽出、空白をトリム。下流クライアントはキャリア由来のノイズ処理が不要 |
-| 🔐 **E2EE ゲート** | `e2ee.require=true` の場合、平文メッセージの中継を拒否し `/push` エンドポイントも無効化。暗号文はそのまま転送 |
-| 📝 **日次ローテートログ** | 汎用ログ `logs/clipsync.log` とメッセージ中継監査 `logs/message.log` を日次で `logs/clipsync/`・`logs/message/` にアーカイブ。保持期間を設定可能 |
-| 🐳 **Docker ネイティブ** | マルチステージビルドで distroless nonroot イメージ（約20MB）を生成。ホストネットワークでホスト上の MySQL/Redis に直接接続、volume で設定とログを永続化 |
-
----
-
-## 🏗️ 技術スタック
-
-- **言語**: Go 1.23
-- **WebSocket**: [gorilla/websocket](https://github.com/gorilla/websocket) v1.5
-- **データベース**: MySQL 8（ユーザー/セッション/端末を永続化、起動時に自動マイグレーション）
-- **キャッシュ**: Redis 7（トークンキャッシュ + オンライン端末登録 + Pub/Sub 制御チャネル）
-- **パスワードハッシュ**: scrypt（`golang.org/x/crypto/scrypt`）
-- **設定**: YAML + `go:embed` によるデフォルト同梱、環境変数オーバーライド対応
-- **実行イメージ**: `gcr.io/distroless/base-debian12:nonroot`（シェルなし、非 root）
+| モジュール | 説明 |
+|------------|------|
+| 🔄 **WebSocket リアルタイム転送** | `userID` グループごとにルーティングし、`notify_pc` / `notify_mobile` / `notify_all` / `clipboard` の4つの配信セマンティクスをサポート。`pc` と `mobile` ロールが相互に送信し、ループすることはありません |
+| 👥 **オンラインデバイス管理** | メモリ上の Hub が実際の WebSocket 接続を権威的に維持。Redis Hash（`clipsync:online:<userID>`、TTL 90秒）がオンライン状態を記録し、30秒ごとのハートビートで更新します。接続切断時には自動的にクリーンアップされ、プロセスが kill されてもゴーストレコードは残りません |
+| 📡 **Presence リアルタイム配信** | デバイスのオンライン/オフライン時に、同じグループのすべての接続へ `presence` メッセージをプッシュし、クライアントがオンラインデバイス UI（プラットフォーム / IP / 機能ビット / カスタム名）をリアルタイムに更新します |
+| 👤 **ユーザーシステム** | 登録 / ログイン、scrypt パスワードハッシュ（N=32768, r=8, p=1）、ランダムトークン（32バイト、SHA-256 ハッシュのみ保存）、トークン TTL（デフォルト720時間 / 30日）、IP 単位のログインレート制限 |
+| 📱 **デバイステーブル管理** | `devices` テーブルにアカウント配下のデバイス（ロール / プラットフォーム / カスタム名 / 最終 IP）を永続化。初回ハンドシェイク時に自動で登録されます。管理者がデバイスを**無効化**すると、その後のハンドシェイクは拒否されます |
+| 👟 **強制ログアウト** | ユーザー単位で全デバイスを蹴る、デバイス単位で1台を蹴る操作に対応。パスワードリセット / ユーザーBAN / ユーザー削除時にも連動してログアウト。5種類の kick reason（パスワードリセット / ユーザーBAN / ユーザー削除 / デバイスキック / デバイス無効化） |
+| 🛡️ **管理API** | `GET /server-admin/users/{id}/devices`（オンライン状態はメモリ Hub を正、Redis で補足）、デバイスの有効/無効・リネーム、全デバイスのページネーション検索、統一アクションエンドポイント `POST /server-admin/kick`。Bearer Token を定数時間比較で認証 |
+| 📨 **Redis Pub/Sub 連携** | ClipSync-Admin と Redis を共有している場合、チャネル `clipsync:admin:kick_user` 経由で制御コマンドを配信し、HTTP API をフォールバックとする二重構成 |
+| 🧹 **SMS ペイロードクリーニング** | `【+86xxx】` / `[N条]` プレフィックスを自動で剥離し、11桁の送信元携帯番号を `sender` に抽出、空白を trim します。下流クライアントでモバイク側の注入を処理する必要はありません |
+| 🔐 **エンドツーエンド暗号化ゲート** | `e2ee.require=true` の場合、平文メッセージの転送を拒否し、`/push` 平文エンドポイントを閉じます。暗号文はサーバーが中継するだけで、内容は見えません |
+| 📝 **日次ログローテーション** | 汎用ログ `logs/clipsync.log` とメッセージ配信ログ `logs/message.log` を、日次で `logs/clipsync/`、`logs/message/` サブディレクトリにアーカイブ。保持日数は設定可能 |
+| 🐳 **Docker ネイティブ** | マルチステージビルド → distroless nonroot イメージ（シェルなし、非 root、攻撃面最小）。host ネットワークでホストの MySQL/Redis に直接接続でき、volume で設定とログを永続化 |
 
 ---
 
 ## 🚀 クイックスタート
 
-### 方法1: Docker Compose（推奨）
+### 方法1：Docker Compose（推奨）
 
-ルートの `docker-compose.yml` はホストネットワークを使用し、ホスト上で稼働中の MySQL/Redis に接続します。
+リポジトリ同梱の `docker-compose.yml` は **host ネットワーク**を使用し、ホスト上の既存 MySQL / Redis に直接接続します。追加のコンテナは起動しません：
+
+```bash
+# 1. 設定の準備
+mkdir -p config logs
+cp deploy/config.external.yaml config/config.yaml
+# config/config.yaml を編集し、mysql.password / redis.password / admin_token を記入
+
+# 2. .env の準備（初期アカウントのパスワードなどを決定）
+cp .env.example .env
+vim .env   # 最低限 BOOTSTRAP_PASSWORD を変更
+
+# 3. 起動
+docker compose up -d
+docker compose logs -f clipsync
+```
+
+起動に成功すると：
+
+- サービスは `:28001` で待ち受けます（host ネットワークがホストポートに直接バインド）
+- 初期アカウントは `.env` の `BOOTSTRAP_USER` / `BOOTSTRAP_PASSWORD` で指定
+- 設定ファイルは `./config/config.yaml` にマウントされ、ログは `./logs/` に書き込まれます
+
+> Compose で MySQL + Redis + Server を一括起動したい場合は、`deploy/config.compose.yaml` を参考にサービス定義を拡張してください。
+
+### 方法2：Docker ワンライナー
+
+```bash
+docker run -d --name clipsync-server \
+  --network host \
+  --restart unless-stopped \
+  -v $(pwd)/config:/data/config:ro \
+  -v $(pwd)/logs:/data/logs \
+  -e TZ=Asia/Shanghai \
+  -e CLIPSYNC_TRUST_PROXY=true \
+  ghcr.io/jh-clipsync/clipsync-server:latest
+```
+
+### 方法3：バイナリ + systemd
+
+[Releases](https://github.com/JH-Clipsync/ClipSync-Server/releases) からプラットフォームに合った tar ボール（`linux-amd64` / `linux-arm64` / `darwin-arm64`）をダウンロードし、展開して以下を実行します：
+
+```bash
+sudo ./install.sh
+```
+
+スクリプトは以下を行います：
+
+1. `/opt/clipsync-server/` にインストール
+2. `clipsync-server.service`（systemd）を登録して起動
+3. ブート時自動起動と失敗時自動再起動を設定
+4. ログを `/opt/clipsync-server/logs/clipsync.log` に出力
+
+よく使うコマンド：
+
+```bash
+sudo systemctl status clipsync-server
+sudo systemctl restart clipsync-server
+tail -f /opt/clipsync-server/logs/clipsync.log
+```
+
+### 方法4：ソースからビルド
+
+Go 1.23 以上が必要です：
 
 ```bash
 git clone https://github.com/JH-Clipsync/ClipSync-Server.git
 cd ClipSync-Server
 
-cp .env.example .env
-# .env を編集 — BOOTSTRAP_PASSWORD は必須、TOKEN_TTL_HOURS / ALLOW_REGISTER も必要に応じて調整
+# 直接実行
+go run .
 
-mkdir -p config logs
-cp deploy/config.external.yaml config/config.yaml
-# config/config.yaml の mysql.password / redis.password を実際の値に編集
-
-docker compose up -d
-docker compose logs -f clipsync
-```
-
-起動確認:
-
-```bash
-curl http://127.0.0.1:28001/health   # "ok" が返ればOK
-```
-
-デフォルトの待受アドレスは `:28001`。初期アカウントは `.env` の `BOOTSTRAP_USER` / `BOOTSTRAP_PASSWORD` で指定します。
-
-### 方法2: 公式イメージを取得
-
-```bash
-docker run -d --name clipsync-server \
-  --network host \
-  -v $(pwd)/config:/data/config:ro \
-  -v $(pwd)/logs:/data/logs \
-  -e TZ=Asia/Shanghai \
-  ghcr.io/jh-clipsync/clipsync-server:latest
-```
-
-イメージレジストリ: [ghcr.io/jh-clipsync/clipsync-server](https://github.com/orgs/JH-Clipsync/packages)
-
-### 方法3: ソースからビルド
-
-```bash
-# 前提: Go 1.23以上、到達可能な MySQL 8 と Redis
-go build -ldflags "-X main.version=1.0.0" -o clipsync-server .
-./clipsync-server --print-default-config > config.yaml
-# config.yaml を編集してから起動
+# または静的バイナリをビルド
+CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=1.0.0" -o clipsync-server .
 ./clipsync-server --config config.yaml
+```
+
+バージョン確認 / 完全なデフォルト設定のエクスポート：
+
+```bash
+./clipsync-server --version
+./clipsync-server --print-default-config > config.yaml
 ```
 
 ---
 
 ## ⚙️ 設定
 
-すべてのデフォルト値は [config.default.yaml](config.default.yaml) に記述され、`go:embed` でバイナリに同梱されます。**Go コードにハードコードされたデフォルトはありません。**
+設定は `go:embed` によって [config.default.yaml](config.default.yaml) がバイナリに埋め込まれ、唯一のデフォルト値ソースとなります。設定の優先順位：
 
-```bash
-# コメント付きの完全な YAML を出力して起点にする
-./clipsync-server --print-default-config > config.yaml
+```
+内蔵デフォルト値  <  config.yaml  <  環境変数
 ```
 
-設定ファイルの検索順: `--config` フラグ → `CLIPSYNC_CONFIG` 環境変数 → `./config.yaml` → `/etc/clipsync/config.yaml`。ファイルが存在しなくてもエラーにはならず、内蔵デフォルトが使用されます。
+設定ファイルの検索順序：
 
-| 項目 | 説明 | デフォルト |
-|---|---|---|
-| `server.addr` | HTTP/WS 待受アドレス | `:28001` |
-| `server.read_timeout` / `write_timeout` | HTTP 読み書きタイムアウト | `15s` |
-| `server.shutdown_timeout` | グレースフルシャットダウン待機時間 | `10s` |
-| `server.trust_proxy` | XFF/XRI プロキシヘッダーを信頼 | `false` |
-| `server.admin_token` | `/server-admin/*` の Bearer トークン。空欄ならエンドポイントを無効化 | 空 |
-| `logs.dir` / `level` / `stdout` / `max_age_days` | ログディレクトリ / レベル / stdout 出力 / 保持日数 | `logs` / `info` / `true` / `0` |
-| `websocket.read_limit` | 1メッセージの最大サイズ（クリップボード画像は大きくなりがち） | `10485760` (10MB) |
-| `websocket.ping_interval_sec` | Ping 間隔 | `30` |
-| `websocket.send_queue_size` | クライアントごとの送信キュー長 | `32` |
-| `message_protocol.max_payload_preview` | ログ上のプレビュー文字数 | `40` |
-| `mysql.*` | MySQL 接続（DSN は自動構築） | `127.0.0.1:3306/clipsync` |
-| `redis.addr` / `db` / `key_prefix` / `online_ttl_sec` | Redis アドレス / DB / キープレフィックス / オンライン TTL | `127.0.0.1:6379` / `0` / `clipsync:` / `90` |
-| `auth.token_ttl_hours` | トークン有効期間（時間） | `720`（30日） |
-| `auth.allow_register` | `POST /auth/register` を公開するか | `false` |
-| `auth.min_password_len` | 登録時の最小パスワード長 | `8` |
-| `auth.bootstrap_user/password` | 起動時に自動作成する初期アカウント | 空 |
-| `auth.login_rate_limit_per_min` | IP ごとの1分あたりログイン試行上限 | `10` |
-| `e2ee.require` | 平文メッセージを拒否し `/push` を無効化 | `false` |
+1. `--config` コマンドライン引数
+2. `CLIPSYNC_CONFIG` 環境変数
+3. `./config.yaml`
+4. `/etc/clipsync/config.yaml`
 
-環境変数でオーバーライドできるのは以下の少数の項目のみ: `CLIPSYNC_ADDR`, `CLIPSYNC_LOG_DIR`, `CLIPSYNC_LOG_LEVEL`, `CLIPSYNC_TRUST_PROXY`, `CLIPSYNC_WS_READ_LIMIT`, `CLIPSYNC_TOKEN_TTL_HOURS`, `CLIPSYNC_ALLOW_REGISTER`, `CLIPSYNC_BOOTSTRAP_USER`, `CLIPSYNC_BOOTSTRAP_PASSWORD`, `CLIPSYNC_E2EE_REQUIRE`。
+ファイルが存在しなくてもエラーにはならず、デフォルト値が使用されます。全フィールドは `clipsync-server --print-default-config` で確認できます。
 
-> ⚠️ **MySQL/Redis の接続情報は設定ファイルからのみ読み込まれます**（環境変数オーバーライドなし）。これは古い環境変数が `config.yaml` を知らない間に上書きする事故を防ぐためです。変更後はプロセスの再起動が必要で、ホットリロードには対応していません。
+### 主な設定セクション
+
+| セクション | キー | 説明 |
+|------------|------|------|
+| `server` | `addr: ":28001"` | 待ち受けアドレス |
+| | `trust_proxy: false` | リバースプロキシ配下で `true` にすると、`X-Forwarded-For` から実 IP を取得します |
+| | `admin_token: ""` | `/server-admin/*` エンドポイントの Bearer Token。空の場合、管理APIはすべて 503 を返します。`openssl rand -hex 32` での生成を推奨 |
+| `logs` | `dir` / `level` / `stdout` / `max_age_days` | ログディレクトリ、レベル（debug/info/warn/error）、stdout への同時出力の有無、アーカイブ保持日数（0=無期限） |
+| `websocket` | `read_limit: 10MB` | 1メッセージあたりの上限。クリップボード画像は大きくなる可能性があります |
+| | `ping_interval_sec: 30` | サーバー Ping 間隔 |
+| | `read_deadline_sec: 60` | 読み取りタイムアウト。死んだ接続がクリーンアップされるまでの時間を決めます |
+| | `send_queue_size: 32` | クライアントごとの送信キュー長 |
+| `mysql` | `host/port/user/password/database` | ユーザー / セッション / デバイスの永続化。起動時に自動でテーブル作成 |
+| | `max_open_conns / max_idle_conns` | コネクションプールのチューニング |
+| `redis` | `addr / password / db` | トークンキャッシュ + オンラインデバイス登録 + Pub/Sub |
+| | `key_prefix: "clipsync:"` | すべてのキーの統一プレフィックス |
+| | `online_ttl_sec: 90` | オンライン登録 TTL。接続中は TTL/3（約30秒）ごとにハートビートで更新 |
+| `auth` | `token_ttl_hours: 720` | トークン有効期間（30日） |
+| | `allow_register: false` | `POST /auth/register` を公開するかどうか。デフォルトは無効で、アカウントは管理者が作成 |
+| | `min_password_len: 8` | 最小パスワード長 |
+| | `bootstrap_user / bootstrap_password` | 起動時に自動作成される初期アカウント（既に存在する場合はスキップ） |
+| | `login_rate_limit_per_min: 10` | ブルートフォース対策の IP 単位の1分あたりログイン試行上限（0=無制限） |
+| `e2ee` | `require: false` | `true` の場合、平文メッセージの転送を拒否し、`/push` 平文エンドポイントを無効化 |
+| `message_protocol` | `check_origin: true` | 任意の Origin からの WebSocket ハンドシェイクを許可するかどうか（本番ではホワイトリスト方式への変更を推奨） |
+| | `max_payload_preview: 40` | ログに出力するペイロードプレビューの切り詰め文字数 |
+
+### 環境変数によるオーバーライド
+
+いくつかの主要な実行パラメータは環境変数で上書きできます：
+
+| 環境変数 | 対応フィールド |
+|----------|----------------|
+| `CLIPSYNC_ADDR` | `server.addr` |
+| `CLIPSYNC_LOG_DIR` | `logs.dir` |
+| `CLIPSYNC_LOG_LEVEL` | `logs.level` |
+| `CLIPSYNC_TRUST_PROXY` | `server.trust_proxy` |
+| `CLIPSYNC_WS_READ_LIMIT` | `websocket.read_limit` |
+| `CLIPSYNC_TOKEN_TTL_HOURS` | `auth.token_ttl_hours` |
+| `CLIPSYNC_ALLOW_REGISTER` | `auth.allow_register` |
+| `CLIPSYNC_BOOTSTRAP_USER` | `auth.bootstrap_user` |
+| `CLIPSYNC_BOOTSTRAP_PASSWORD` | `auth.bootstrap_password` |
+| `CLIPSYNC_E2EE_REQUIRE` | `e2ee.require` |
+
+> MySQL / Redis の接続情報は意図的に環境変数での上書きを提供していません。設定ファイルを編集して再起動してください。「設定を変えたのに残っていた環境変数に知らないうちに上書きされた」を防ぐためです。
 
 ---
 
-## 🔌 API リファレンス
+## 📡 API 仕様
 
-### クライアント向けエンドポイント
+### クライアントAPI（ユーザートークンで認証）
 
-| パス | メソッド | 説明 |
-|---|---|---|
-| `/ws?token=&device=&role=pc\|mobile&platform=&caps=&name=` | GET (WS) | 長寿命クライアント接続。ハンドシェイク時に認証と端末審査を実施 |
-| `/auth/register` | POST | 登録（`allow_register` で制御） |
-| `/auth/login` | POST | ユーザー名/パスワードをトークンに交換 |
-| `/auth/session` | GET | 現在のセッションとオンライン端末を取得 |
-| `/auth/logout` | POST | ログアウトしてセッションを消去 |
-| `/auth/change-password` | POST | 自身のパスワードを変更 |
-| `/device/name` | POST | 現在の端末のカスタム名を変更 |
-| `/push?token=` | POST (JSON) | 簡易プッシュ（curl でテスト可能、`e2ee.require` 有効時は無効） |
-| `/health` | GET | ヘルスチェック |
+| メソッド | パス | 説明 |
+|----------|------|------|
+| GET | `/ws` | WebSocket アップグレードエンドポイント。クエリパラメータ `token` / `device` / `role`（pc/mobile、旧値 phone も互換） / `platform` / `caps` / `name` |
+| POST | `/auth/register` | 登録（`auth.allow_register` スイッチで制御） |
+| POST | `/auth/login` | ログイン、トークンを返却。既存のクライアントがオンラインの場合は同じトークンを再利用し、`reused=true` を返却 |
+| POST | `/auth/logout` | 現在のトークンを無効化 |
+| GET | `/auth/session` | 現在のセッション状態とオンラインデバイスを照会 |
+| POST | `/auth/change-password` | パスワード変更。旧トークンは即時無効化され全デバイスがログアウト、新しいトークンを返却 |
+| POST | `/push` | 簡易 HTTP プッシュエンドポイント（curl デバッグ用、`e2ee.require=true` 時は無効） |
+| POST | `/device/name` | ユーザーが自身のデバイスをリネーム（presence をリアルタイムブロードキャスト） |
+| GET | `/health` | ヘルスチェック、`ok` を返却 |
 
-### 管理 API（`/server-admin/*`、Bearer トークン）
+### 管理API（`admin_token` で認証）
 
-| パス | メソッド | 説明 |
-|---|---|---|
-| `/server-admin/users` | POST | 管理者によるユーザー作成（登録スイッチをバイパス） |
-| `/server-admin/users/{id}/devices` | GET | ユーザーの全端末を取得（オンライン状態はメモリ Hub 準拠） |
-| `/server-admin/users/{id}/devices/{deviceID}/status` | PUT | 端末の有効/無効化（無効化すると同時にキック） |
-| `/server-admin/users/{id}/devices/{deviceID}/name` | PUT | 端末名変更（presence をブロードキャスト） |
-| `/server-admin/devices` | GET | 全ユーザー横断のページング検索（keyword/disabled/user_id） |
-| `/server-admin/kick` | POST | 統一キックエントリ（kick_user / kick_device / disable_device / enable_device） |
+すべての `/server-admin/*` エンドポイントには以下のヘッダーが必要です：
 
-### メッセージフレーム例
-
-```json
-{ "type": "notify_pc", "kind": "sms_code", "text": "【MyBank】認証コード 314159" }
+```
+Authorization: Bearer <server.admin_token>
 ```
 
-```bash
-# SMS コードを全 PC クライアントへプッシュ
-curl -X POST 'http://127.0.0.1:28001/push?token=<your-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{"type":"notify_pc","kind":"sms_code","text":"【テスト】認証コードは 314159"}'
-```
+| メソッド | パス | 説明 |
+|----------|------|------|
+| POST | `/server-admin/users` | 管理者によるユーザー作成（`allow_register` の制限を受けない） |
+| GET | `/server-admin/users/{id}/devices` | ユーザーの全デバイスを一覧。**オンライン状態はメモリ Hub を正とし、Redis で補足** |
+| GET | `/server-admin/devices` | ユーザーをまたいだページネーション検索。`keyword` / `disabled` / `user_id` / `page` / `page_size` をサポート |
+| PUT | `/server-admin/users/{id}/devices/{deviceID}/status` | デバイスの有効化/無効化。無効化すると即座にログアウト |
+| PUT | `/server-admin/users/{id}/devices/{deviceID}/name` | デバイスをリネームし、オンライン接続へ presence をブロードキャスト |
+| POST | `/server-admin/kick` | 統一アクションエンドポイント。body は `kick_user` / `kick_device` / `disable_device` / `enable_device` をサポート |
+
+### WebSocket メッセージタイプ
+
+| `type` | 配信範囲 | 代表的なユースケース |
+|--------|----------|----------------------|
+| `notify_pc` | 同グループの全 `pc` ロール | SMS認証コードを PC に同期 |
+| `notify_mobile` | 同グループの全 `mobile` ロール | PC からスマホへ通知をプッシュ |
+| `notify_all` | 同グループの全デバイス（自分を除く） | 汎用ブロードキャスト |
+| `clipboard` | 同グループの全デバイス（自分を除く） | クリップボードテキスト / 画像。受信側が設定に応じて自動書き込みするかを決定 |
+| `presence` | サーバーからクライアントへのみ | オンラインデバイスリスト変更通知 |
+| `server_kick` | サーバーからクライアントへのみ | 強制ログアウト。`reason` フィールドを伴う |
+
+### Redis Pub/Sub チャネル
+
+- チャネル名：`{redis.key_prefix}admin:kick_user`（デフォルト `clipsync:admin:kick_user`）
+- メッセージボディは JSON：`{"action":"kick_user|kick_device|disable_device|enable_device","user_id":1,"device_id":"...","reason":"..."}`
+- 数値のみの `userID` とも互換（`kick_user` と等価）
+- Admin がパブリッシャー、Server がサブスクライバー。自動再接続あり（指数バックオフ、最大30秒）
 
 ---
 
-## 🔐 プレゼンスモデル
+## 🏗️ プロジェクト構成
 
 ```
-       ┌──── メモリ Hub（権威）────┐
-       │  userID → set<*Client>    │
-       └───────────┬───────────────┘
-                   │ 30秒ごとのハートビートで更新
-                   ▼
-       Redis Hash  clipsync:online:<userID>
-                 field=deviceID  value=role
-                 TTL = 90秒（TTL/3 間隔でリフレッシュ）
+┌──────────────┐  WebSocket   ┌──────────────────────────────┐
+│  PC/Mobile   │ ──────────▶  │      ClipSync-Server         │
+│   Clients    │ ◀──────────  │  ┌────────────────────────┐  │
+└──────────────┘   presence   │  │  Hub（メモリ）         │  │
+                              │  │  userID -> []*Client   │  │
+                              │  └──────────┬─────────────┘  │
+                              │             │                │
+                              │  ┌──────────▼─────────────┐  │
+                              │  │  AuthService           │  │
+                              │  │  ┌──────┐  ┌────────┐  │  │
+                              │  │  │MySQL │  │ Redis  │  │  │
+                              │  │  └──────┘  └────────┘  │  │
+                              │  └────────────────────────┘  │
+                              └──────────┬───────────────────┘
+                                         │ Redis Pub/Sub + HTTP
+                                         ▼
+                              ┌──────────────────────────────┐
+                              │       ClipSync-Admin         │
+                              └──────────────────────────────┘
 ```
 
-- **オンライン判定はメモリ Hub が権威**です。接続があればオンライン、なければオフライン。
-- Redis Hash は主にログイン時の「このユーザーには既にクライアントがあるか」の判定や、管理画面でのクロスプロセス表示に使われます。
-- `kill -9` でプロセスが落ちても、Redis のエントリは90秒以内に自然に失効し、幽霊オンラインは残りません。
+### データモデル
+
+- **users**：アカウント。パスワードは scrypt ハッシュのみ保存、`disabled` で BAN を制御
+- **sessions**：1ユーザーにつき最大1件のアクティブセッション（`user_id` が主キー）。全デバイスが同じトークンを共有。トークンは SHA-256 ハッシュのみ保存
+- **devices**：`(user_id, device_id)` 複合主キー。ロール / プラットフォーム / カスタム名 / 最終 IP / 無効状態 / 最終オンライン時刻を記録
+
+### コード構成
+
+| ファイル | 役割 |
+|----------|------|
+| [main.go](main.go) | Hub / Client / WebSocket ルーティング / presence ブロードキャスト / ハートビート / HTTP ルートエントリ / グレースフルシャットダウン |
+| [config.go](config.go) / [config.default.yaml](config.default.yaml) | 設定構造体、読み込み順序、環境変数オーバーライド |
+| [auth_service.go](auth_service.go) / [auth_http.go](auth_http.go) / [auth_crypto.go](auth_crypto.go) | ログイン / 登録 / セッション / scrypt + トークンハッシュ / レート制限 |
+| [store_mysql.go](store_mysql.go) | ユーザー / セッション永続化と自動テーブル作成 |
+| [store_device.go](store_device.go) | デバイステーブル CRUD、ページネーション検索、無効状態 |
+| [store_redis.go](store_redis.go) | トークンキャッシュ、オンライン登録、Pub/Sub 管理チャネル |
+| [admin_http.go](admin_http.go) | `/server-admin/*` エンドポイント実装 |
+| [e2ee.go](e2ee.go) | エンドツーエンド暗号化ポリシーゲート |
+| [logger.go](logger.go) | 日次ローテーション + アーカイブ保持 + 汎用/メッセージの2重ログ |
+| [device_name_http.go](device_name_http.go) | ユーザー自身によるデバイスリネーム |
 
 ---
 
-## 🐳 デプロイ構成
+## 🔐 セキュリティについて
 
-### ClipSync-Admin との連携
+- **パスワード保存**：scrypt（N=32768, r=8, p=1、32バイト派生キー、16バイトランダムソルト）、形式 `scrypt$N$r$p$salt$dk`。パラメータはハッシュと共に保存され、将来的にスムーズにアップグレード可能
+- **トークン保存**：32バイトのランダムトークン。MySQL / Redis には SHA-256 ハッシュのみ保存。平文トークンは「同一アカウントの複数デバイスで同じセッションを再利用」するために TTL 付きで Redis に一時的に置かれるだけです
+- **ログインレート制限**：IP 単位のスライディングウィンドウ、デフォルト10回/分。ユーザー名エラーとパスワードエラーは同一エラーを返し、ユーザー名列挙を防止
+- **管理API認証**：`admin_token` が空なら 503。比較は `subtle.ConstantTimeCompare` で行い、タイミング攻撃を防止
+- **リバースプロキシ信頼**：`trust_proxy=false` の場合、`X-Forwarded-For` を無視し、偽造ヘッダーによる欺瞞を防止
+- **WebSocket Origin**：本番環境では `message_protocol.check_origin` を `false` にし、ホワイトリストで検証することを推奨
+- **エンドツーエンド暗号化**：3端末すべてが暗号化対応バージョンにアップグレードした後、`e2ee.require` を `true` にすると、サーバーは平文メッセージを一切拒否します
+- **コンテナセキュリティ**：distroless nonroot イメージ、シェルなし、パッケージマネージャなし、uid 65532 の非 root で実行
+- **通信セキュリティ**：本番環境では必ず手前に Nginx / Caddy を置いて TLS を終端してください（以下の例を参照）
 
-```
-        ┌────────────────────┐        Redis Pub/Sub
-        │  ClipSync-Admin    │ ───────────────────────▶  ClipSync-Server
-        │  (admin :28002)    │   clipsync:admin:kick_user  (本サービス :28001)
-        └─────────┬──────────┘ ◀───────────────────────  └────────┬─────────┘
-                  │  HTTP フォールバック (admin_token)             │
-                  └───────────────────────────────────────────────┘
-                          同一 MySQL（clipsync DB）を共有
-```
-
-- 両サービスは同一の MySQL データベース `clipsync` を共有します;
-- Server が `users` / `sessions` / `devices` テーブルの書き込み権限を持ちます;
-- Admin は Redis Pub/Sub 経由で Server にキック/無効化を通知し、Redis 不通時は HTTP にフォールバックします;
-- 端末のオンライン状態はまず Server の `/server-admin/users/{id}/devices` から取得し、失敗時はローカル MySQL+Redis にフォールバックします。
-
-### リバースプロキシ
-
-本番では必ず Nginx/Caddy + TLS を前面に置いてください。[Caddyfile.example](Caddyfile.example) と [deploy/nginx.clipsync.conf](deploy/nginx.clipsync.conf)（Admin リポジトリにありますが、プロキシ設定は Server にも共通）を参照してください。
-
-重要: **WebSocket の長寿命接続には長い `proxy_read_timeout`** が必要です（3600秒以上を推奨）。実際のクライアント IP を記録するため、`server.trust_proxy: true` も必要です。
+### Nginx リバースプロキシの例
 
 ```nginx
 location = /clipsync/ws {
@@ -234,87 +312,67 @@ location = /clipsync/ws {
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+
+location /clipsync/ {
+    proxy_pass http://127.0.0.1:28001/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
 
----
+`config.yaml` で `server.trust_proxy` を `true` に設定するのを忘れないでください。
 
-## 📁 プロジェクト構成
+### Caddy リバースプロキシの例
+
+リポジトリに [Caddyfile.example](Caddyfile.example) が用意されています：
 
 ```
-ClipSync-Server/
-├── main.go                 # ルーティング + WebSocket Hub + メッセージルーティング + グレースフルシャットダウン
-├── config.go               # 設定構造体 + YAML 読み込み + 環境変数オーバーライド
-├── config.default.yaml     # 同梱デフォルト設定（デフォルト値の唯一のソース）
-├── auth_http.go            # /auth/* 登録/ログイン/セッション/パスワード変更 HTTP
-├── auth_service.go         # 認証ロジック: ログイン、セッション再利用、レート制限
-├── auth_crypto.go          # scrypt パスワードハッシュ + トークン SHA-256
-├── admin_http.go           # /server-admin/* 管理 API
-├── device_name_http.go     # セルフ端末リネーム
-├── store_mysql.go          # MySQL: users / sessions テーブル
-├── store_device.go         # MySQL: devices テーブル（upsert/無効化/リネーム/検索）
-├── store_redis.go          # Redis: トークンキャッシュ + オンライン Hash + Pub/Sub
-├── e2ee.go                 # E2EE ゲート + エンベロープ解析
-├── logger.go               # 日次ローテートロガー（汎用 + メッセージカテゴリ）
-├── Dockerfile              # マルチステージビルド → distroless nonroot
-├── docker-compose.yml      # ホストネットワーク構成
-├── Caddyfile.example       # HTTPS リバースプロキシ例
-├── deploy/
-│   ├── config.compose.yaml   # オールイン Docker 用の設定雛形
-│   ├── config.external.yaml  # MySQL/Redis がホスト上にある場合の設定雛形
-│   └── mysql/init.sql        # DB 初期化スクリプト（サーバー起動時にも自動マイグレーション）
-└── .github/workflows/docker-image.yml  # タグ push でマルチアーキイメージを自動ビルド
+clipsync.example.com {
+    reverse_proxy 127.0.0.1:28001
+}
 ```
 
----
-
-## 🔐 セキュリティ
-
-| 観点 | 設計 |
-|------|------|
-| パスワード保存 | scrypt（N=32768, r=8, p=1、32バイト派生鍵、16バイトランダムソルト） |
-| トークン保存 | MySQL には SHA-256 ハッシュのみ保存。平文トークンは TTL 付きで Redis に置くだけで、DB 漏洩時も再利用不可 |
-| 通信暗号化 | Nginx/Caddy で `wss://` を構成。E2EE は AES-256-GCM をクライアント側で実施 |
-| ブルートフォース対策 | IP ごとにログイン試行を制限（デフォルト10回/分） |
-| 管理 API | `admin_token` を `crypto/subtle.ConstantTimeCompare` で比較しタイミング攻撃を防止 |
-| クライアント偽装 | サーバーが `from` フィールドを強制上書き。`ping/pong/presence` 制御メッセージは転送しない |
-| イメージ強化 | distroless nonroot（uid 65532）、シェルなし・パッケージマネージャなしで最小の攻撃面 |
+Caddy は自動的に Let's Encrypt 証明書を申請・更新します。
 
 ---
 
 ## 🐛 トラブルシューティング
 
-| 現象 | 確認すること |
-|------|--------------|
-| クライアントが接続できない | ファイアウォールで 28001 を許可、プロキシが Upgrade ヘッダーを転送しているか、URL は `ws://IP:28001/ws` |
-| ログの IP がプロキシのアドレスばかり | `server.trust_proxy: true` を有効化して再起動 |
-| 管理 API が 401 | `server.admin_token` が設定されているか、`Authorization: Bearer <token>` が送られているか |
-| コンテナ再起動でログが消える | `./logs:/data/logs` をマウントしているか |
-| 設定変更が反映されない | 設定は起動時に読み込み。`docker compose restart` または `systemctl restart` が必要 |
-| 切断済み端末が Redis でオンライン表示 | 90秒の TTL で自然失効。実際のルーティングにはメモリ Hub が使われ影響なし |
-| `/push` が 403 を返す | `e2ee.require=true` の場合、平文プッシュは無効化されます |
+| 現象 | 確認項目 |
+|------|----------|
+| クライアントのハンドシェイクが 401 を返す | トークンが無効か期限切れ。Redis に `clipsync:token:*` が存在するか、サーバー時刻が正確かを確認 |
+| クライアントのハンドシェイクが 403「デバイスは管理者により無効化されています」を返す | `devices.disabled=1`。管理画面でデバイスを有効化 |
+| クライアントが接続後すぐ切断される | `websocket.read_deadline_sec` が小さすぎないか、リバースプロキシが Ping/Pong フレームを飲み込んでいないか、Nginx に `proxy_read_timeout` が設定されているかを確認 |
+| オンライン状態が正確でない | メモリ Hub が権威ソースです。Redis オンライン TTL はデフォルト90秒で、30秒ごとに更新されます。Redis がクリアされた場合は再接続後に自動回復します。プロセスが異常終了した場合は90秒待てばキーが自然に期限切れになります |
+| 管理APIが 503 を返す | `server.admin_token` が未設定。設定後に再起動 |
+| 管理APIが 401 を返す | `Authorization: Bearer <token>` ヘッダーがサーバーの `admin_token` と一致しない |
+| ログインで「試行回数が多すぎます」と表示 | IP 単位のレート制限が発動。1分待つか、`auth.login_rate_limit_per_min` を大きくする |
+| リバースプロキシ配下でログの IP がすべて 127.0.0.1 になる | `server.trust_proxy` を `true` にし、リバースプロキシが `X-Forwarded-For` を設定していることを確認 |
+| クリップボード画像が受信できない | `websocket.read_limit`（デフォルト10MB）とリバースプロキシの `client_max_body_size` を確認 |
+| Docker コンテナが MySQL / Redis に接続できない | host ネットワークでは `127.0.0.1:<ホストポート>` を指定。MySQL が `127.0.0.1` からの接続を許可しているか、ファイアウォールでポートがブロックされていないかを確認 |
+| ログファイルが生成されない | `logs.dir` のディレクトリ権限を確認。distroless nonroot イメージでは uid 65532 がログディレクトリに書き込める必要があります。compose では `user: "0:0"` でフォールバックしています |
 
-ログ出力先: `logs/clipsync.log`（汎用）、`logs/message.log`（メッセージ中継監査）、日次アーカイブは `logs/clipsync/`・`logs/message/`。
+### ログの場所
+
+- 汎用ログ：`logs/clipsync.log`（当日）+ `logs/clipsync/clipsync-YYYY-MM-DD.log`（アーカイブ）
+- メッセージ配信ログ：`logs/message.log`（当日）+ `logs/message/message-YYYY-MM-DD.log`（アーカイブ）
+
+メッセージログは独立したファイルで、各メッセージの受信 / 送信 / 破棄、業務分類（SMS / クリップボード / 通知）、コンテンツ形式（テキスト / 画像）、配信範囲を記録し、監査とトラブルシューティングを容易にします。
 
 ---
 
 ## 🤝 関連プロジェクト
 
-| プロジェクト | 技術スタック | リンク |
-|------|--------|------|
-| 管理画面バックエンド | Go + Gin + GORM | [JH-Clipsync/ClipSync-Admin](https://github.com/JH-Clipsync/ClipSync-Admin) |
-| 管理画面フロントエンド | Vue 3 + Element Plus | [JH-Clipsync/ClipSync-Admin-Web](https://github.com/JH-Clipsync/ClipSync-Admin-Web) |
-| Android クライアント | Kotlin + OkHttp | [JH-Clipsync/ClipSync-Android](https://github.com/JH-Clipsync/ClipSync-Android) |
-| macOS クライアント | Swift + SwiftUI | [JH-Clipsync/ClipSync-Mac](https://github.com/JH-Clipsync/ClipSync-Mac) |
-| Windows クライアント | .NET 8 + WPF | [JH-Clipsync/ClipSync-Windows](https://github.com/JH-Clipsync/ClipSync-Windows) |
-
----
-
-## 📄 License
-
-個人利用のプロジェクトです。コードの参照・改変は自由に行ってください。
-
----
-
-**Made with ❤️ · 全プラットフォーム自作 · データはあなたのもの**
+- [ClipSync-Admin](https://github.com/JH-Clipsync/ClipSync-Admin)：管理バックエンド（Go + Gin + GORM）
+- [ClipSync-Admin-Web](https://github.com/JH-Clipsync/ClipSync-Admin-Web)：管理フロントエンド（Vue 3 + Element Plus）
+- [ClipSync-Windows](https://github.com/JH-Clipsync/ClipSync-Windows)：Windows クライアント
+- [ClipSync-Mac](https://github.com/JH-Clipsync/ClipSync-Mac)：macOS クライアント
+- [ClipSync-Android](https://github.com/JH-Clipsync/ClipSync-Android)：Android クライアント
