@@ -67,14 +67,18 @@ func (a *AuthService) OnlineDevices(ctx context.Context, userID int64) (map[stri
 // EnsureDeviceAllowed 在 WS 握手阶段调用：首次见到的设备自动建档，
 // 已被管理员禁用的设备直接返回 ErrDeviceDisabled，拒绝升级连接。
 //
-// role/platform 由客户端 query 上报，旧客户端没带 platform 时由 main 里
-// 的 platformFromDeviceID 兜底推断后再传进来。
-func (a *AuthService) EnsureDeviceAllowed(ctx context.Context, userID int64, deviceID, role, platform string) error {
+// role/platform/name/clientIP 由客户端 query 上报，旧客户端没带 platform 时由
+// main 里的 platformFromDeviceID 兜底推断后再传进来；name 为空时保留旧值。
+func (a *AuthService) EnsureDeviceAllowed(
+	ctx context.Context, userID int64, deviceID, role, platform, name, clientIP string,
+) error {
 	if err := a.db.UpsertDevice(ctx, &Device{
 		UserID:   userID,
 		DeviceID: deviceID,
 		Role:     role,
 		Platform: platform,
+		Name:     name,
+		LastIP:   clientIP,
 	}); err != nil {
 		// 建档失败不阻断连接：设备表只是管理能力，不能因此影响正常同步
 		logWarn("⚠ 设备建档失败 user=%d device=%s: %v", userID, shortID(deviceID), err)
@@ -93,6 +97,18 @@ func (a *AuthService) EnsureDeviceAllowed(ctx context.Context, userID int64, dev
 // ListDevices 列出用户所有登记过的设备（含离线）。供管理端接口使用。
 func (a *AuthService) ListDevices(ctx context.Context, userID int64) ([]*Device, error) {
 	return a.db.ListDevices(ctx, userID)
+}
+
+// ListAllDevices 跨用户分页查询设备。keyword 同时模糊匹配用户名/设备ID/名称/IP。
+func (a *AuthService) ListAllDevices(
+	ctx context.Context, f DeviceFilter,
+) ([]*DeviceRow, int64, error) {
+	return a.db.ListAllDevices(ctx, f)
+}
+
+// CountDevices 统计某用户登记过的设备总数（含离线）。
+func (a *AuthService) CountDevices(ctx context.Context, userID int64) (int64, error) {
+	return a.db.CountDevices(ctx, userID)
 }
 
 // SetDeviceStatus 启用/禁用指定账号下的一台设备。禁用一台设备只影响后续登录/握手，

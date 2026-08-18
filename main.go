@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -184,6 +185,20 @@ func (h *Hub) onlineDeviceIDs(userID int64) map[string]struct{} {
 	m := make(map[string]struct{}, len(set))
 	for c := range set {
 		m[c.deviceID] = struct{}{}
+	}
+	return m
+}
+
+// allOnlineDeviceIDs 返回所有在线连接的 "userID:deviceID" 集合，
+// 供管理端全量设备列表标记在线状态用。
+func (h *Hub) allOnlineDeviceIDs() map[string]struct{} {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	m := make(map[string]struct{})
+	for userID, set := range h.clients {
+		for c := range set {
+			m[strconv.FormatInt(userID, 10)+":"+c.deviceID] = struct{}{}
+		}
 	}
 	return m
 }
@@ -857,6 +872,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	// caps：客户端同步能力/开关，逗号分隔，如 "clip_up,sms_in,auto_put"
 	caps := parseCaps(q.Get("caps"))
+	// 设备名：客户端可以在握手时上报本机自定义名称（如"我的 MacBook"）
+	name := strings.TrimSpace(q.Get("name"))
 
 	if token == "" || device == "" {
 		http.Error(w, "参数错误: 需要 token 和 device", http.StatusBadRequest)
@@ -874,8 +891,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 设备准入：首次见到的设备自动建档；已被管理员禁用的设备直接拒绝升级。
+	clientIP := extractIP(r)
 	deviceCtx, deviceCancel := context.WithTimeout(r.Context(), 5*time.Second)
-	err = authService.EnsureDeviceAllowed(deviceCtx, userID, device, role, platform)
+	err = authService.EnsureDeviceAllowed(deviceCtx, userID, device, role, platform, name, clientIP)
 	deviceCancel()
 	if err != nil {
 		logWarn("⚠ 拒绝连接: device=%s user=%d 设备已被禁用", shortID(device), userID)
@@ -883,10 +901,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 加载该设备的自定义名称（用户在端上设置过则有值）
-	nameCtx, nameCancel := context.WithTimeout(r.Context(), 5*time.Second)
-	deviceName, _ := authService.GetDeviceName(nameCtx, userID, device)
-	nameCancel()
+	// 加载该设备的自定义名称（如果客户端没上报，用库里已有的）
+	if name == "" {
+		nameCtx, nameCancel := context.WithTimeout(r.Context(), 5*time.Second)
+		name, _ = authService.GetDeviceName(nameCtx, userID, device)
+		nameCancel()
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -902,12 +922,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		token:    token,
 		deviceID: device,
 		role:     role,
-		ip:       extractIP(r),
+		ip:       clientIP,
 		send:     make(chan []byte, sendQueue),
 		userID:   userID,
 		onlineAt: time.Now(),
 		platform: platform,
-		name:     deviceName,
+		name:     name,
 		caps:     caps,
 	}
 
@@ -1264,9 +1284,11 @@ func main() {
 	mux.HandleFunc("/auth/change-password", changePasswordHandler)
 
 	// 管理端 HTTP 接口（走 admin_token 鉴权，与 Redis Pub/Sub 形成双保险）
-	mux.HandleFunc("GET /admin/users/{id}/devices", requireAdminToken(adminListDevices))
-	mux.HandleFunc("PUT /admin/users/{id}/devices/{deviceID}/status", requireAdminToken(adminSetDeviceStatus))
-	mux.HandleFunc("POST /admin/kick", requireAdminToken(adminKick))
+	mux.HandleFunc("GET /server-admin/devices", requireAdminToken(adminListAllDevices))
+	mux.HandleFunc("GET /server-admin/users/{id}/devices", requireAdminToken(adminListDevices))
+	mux.HandleFunc("PUT /server-admin/users/{id}/devices/{deviceID}/status", requireAdminToken(adminSetDeviceStatus))
+	mux.HandleFunc("PUT /server-admin/users/{id}/devices/{deviceID}/name", requireAdminToken(adminRenameDevice))
+	mux.HandleFunc("POST /server-admin/kick", requireAdminToken(adminKick))
 
 	// 普通用户 HTTP 接口（走登录 token 鉴权）
 	mux.HandleFunc("POST /device/name", requireUserToken(handleRenameDevice))

@@ -13,9 +13,12 @@ import (
 // adminDeviceResponse 给管理端返回的设备信息（含在线状态）。
 type adminDeviceResponse struct {
 	UserID     int64  `json:"user_id"`
+	Username   string `json:"username,omitempty"`
 	DeviceID   string `json:"device_id"`
 	Role       string `json:"role"`
 	Platform   string `json:"platform"`
+	Name       string `json:"name"`
+	LastIP     string `json:"last_ip"`
 	Disabled   bool   `json:"disabled"`
 	Online     bool   `json:"online"`
 	LastSeenAt string `json:"last_seen_at"`
@@ -77,6 +80,8 @@ func adminListDevices(w http.ResponseWriter, r *http.Request) {
 			DeviceID:   d.DeviceID,
 			Role:       d.Role,
 			Platform:   d.Platform,
+			Name:       d.Name,
+			LastIP:     d.LastIP,
 			Disabled:   d.Disabled,
 			Online:     isOnline,
 			LastSeenAt: d.LastSeenAt.Format(time.RFC3339),
@@ -84,6 +89,101 @@ func adminListDevices(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
+}
+
+// adminListAllDevices GET /admin/devices
+// 跨用户分页查询设备，支持按 username/device_id/name/last_ip 模糊搜索、按禁用状态过滤。
+// 查询参数：keyword、disabled(true/false)、page、page_size
+func adminListAllDevices(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(q.Get("page_size"))
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 20
+	}
+	f := DeviceFilter{
+		Keyword: q.Get("keyword"),
+		Offset:  (page - 1) * pageSize,
+		Limit:   pageSize,
+	}
+	switch strings.ToLower(q.Get("disabled")) {
+	case "true":
+		t := true
+		f.Disabled = &t
+	case "false":
+		f2 := false
+		f.Disabled = &f2
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, total, err := authService.ListAllDevices(ctx, f)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	onlineSet := hub.allOnlineDeviceIDs()
+	out := make([]adminDeviceResponse, 0, len(rows))
+	for _, d := range rows {
+		_, online := onlineSet[strconv.FormatInt(d.UserID, 10)+":"+d.DeviceID]
+		out = append(out, adminDeviceResponse{
+			UserID:     d.UserID,
+			Username:   d.Username,
+			DeviceID:   d.DeviceID,
+			Role:       d.Role,
+			Platform:   d.Platform,
+			Name:       d.Name,
+			LastIP:     d.LastIP,
+			Disabled:   d.Disabled,
+			Online:     online,
+			LastSeenAt: d.LastSeenAt.Format(time.RFC3339),
+			CreatedAt:  d.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"list":  out,
+		"total": total,
+		"page":  page,
+	})
+}
+
+// adminRenameDevice PUT /admin/users/{id}/devices/{deviceID}/name
+// body: {"name": "新设备名"}
+func adminRenameDevice(w http.ResponseWriter, r *http.Request) {
+	userID, ok := int64PathParam(w, r, "id")
+	if !ok {
+		return
+	}
+	deviceID := r.PathValue("deviceID")
+	if deviceID == "" {
+		http.Error(w, "缺少 deviceID", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "请求体不合法", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		http.Error(w, "设备名称不能为空", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := authService.UpdateDeviceName(ctx, userID, deviceID, body.Name); err != nil {
+		if errors.Is(err, ErrDeviceNotFound) {
+			http.Error(w, "设备不存在", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	hub.renameDevice(userID, deviceID, body.Name)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // adminSetDeviceStatus PUT /admin/users/{id}/devices/{deviceID}/status
