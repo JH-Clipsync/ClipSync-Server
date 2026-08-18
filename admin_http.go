@@ -51,7 +51,7 @@ func requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 // writeJSONAdmin 与 auth_http.go 中统一 JSON 响应同名，这里直接复用。
 // 为了避免重复声明，本文件不再实现 writeJSON。
 
-// adminListDevices GET /admin/users/{id}/devices
+// adminListDevices GET /server-admin/users/{id}/devices
 func adminListDevices(w http.ResponseWriter, r *http.Request) {
 	userID, ok := int64PathParam(w, r, "id")
 	if !ok {
@@ -91,7 +91,7 @@ func adminListDevices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
 }
 
-// adminListAllDevices GET /admin/devices
+// adminListAllDevices GET /server-admin/devices
 // 跨用户分页查询设备，支持按 username/device_id/name/last_ip 模糊搜索、按禁用状态过滤。
 // 查询参数：keyword、disabled(true/false)、page、page_size
 func adminListAllDevices(w http.ResponseWriter, r *http.Request) {
@@ -149,7 +149,7 @@ func adminListAllDevices(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// adminRenameDevice PUT /admin/users/{id}/devices/{deviceID}/name
+// adminRenameDevice PUT /server-admin/users/{id}/devices/{deviceID}/name
 // body: {"name": "新设备名"}
 func adminRenameDevice(w http.ResponseWriter, r *http.Request) {
 	userID, ok := int64PathParam(w, r, "id")
@@ -186,7 +186,7 @@ func adminRenameDevice(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// adminSetDeviceStatus PUT /admin/users/{id}/devices/{deviceID}/status
+// adminSetDeviceStatus PUT /server-admin/users/{id}/devices/{deviceID}/status
 // body: {"disabled": true|false}
 func adminSetDeviceStatus(w http.ResponseWriter, r *http.Request) {
 	userID, ok := int64PathParam(w, r, "id")
@@ -222,7 +222,7 @@ func adminSetDeviceStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// adminKick POST /admin/kick
+// adminKick POST /server-admin/kick
 // 兼容两种 body：
 //  1. {"user_id":123}                   踢用户所有设备
 //  2. {"user_id":123,"device_id":"xx"}  只踢该设备

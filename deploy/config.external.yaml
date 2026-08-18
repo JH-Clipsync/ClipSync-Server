@@ -24,6 +24,10 @@ server:
   write_timeout: 15s
   shutdown_timeout: 10s
   trust_proxy: true
+  # 管理端（ClipSync-Admin）通过 HTTP 调用 /server-admin/* 接口时携带的 Bearer Token；
+  # 留空则这些接口一律返回 503。必须与管理端 server.http_admin_token 完全一致。
+  # 生成方式：openssl rand -hex 32
+  admin_token: ""
 
 logs:
   dir: "/data/logs"

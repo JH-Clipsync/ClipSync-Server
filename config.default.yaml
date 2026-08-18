@@ -16,7 +16,7 @@ server:
   shutdown_timeout: 10s
   # 反代在前面时置 true，才能从 X-Forwarded-For / X-Real-IP 取真实 IP
   trust_proxy: false
-  # 管理端（ClipSync-Admin）通过 HTTP 调用 /admin/* 接口（踢下线、禁用设备等）
+  # 管理端（ClipSync-Admin）通过 HTTP 调用 /server-admin/* 接口（踢下线、禁用设备等）
   # 时使用的 Bearer Token；留空则这些接口一律拒绝访问。和管理端 server.http_admin_token 保持一致。
   admin_token: ""
 
