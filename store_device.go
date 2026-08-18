@@ -212,6 +212,8 @@ func (s *MySQLStore) GetDeviceName(ctx context.Context, userID int64, deviceID s
 }
 
 // UpdateDeviceName 更新某账号下一台设备的自定义名称。
+// 注意：MySQL 默认在「新值与旧值相同」时 RowsAffected 返回 0，不能据此判定设备不存在，
+// 因此 UPDATE 影响 0 行时再 SELECT 一次确认真实情况。
 func (s *MySQLStore) UpdateDeviceName(ctx context.Context, userID int64, deviceID, name string) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE devices SET name = ? WHERE user_id = ? AND device_id = ?`,
@@ -220,12 +222,19 @@ func (s *MySQLStore) UpdateDeviceName(ctx context.Context, userID int64, deviceI
 		return fmt.Errorf("更新设备名称失败: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrDeviceNotFound
+		exists, err := s.deviceExists(ctx, userID, deviceID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrDeviceNotFound
+		}
 	}
 	return nil
 }
 
 // UpdateDeviceStatus 启用/禁用指定账号下的一台设备。
+// 同样存在「值未变时 RowsAffected=0」的问题，需要二次确认设备是否存在。
 func (s *MySQLStore) UpdateDeviceStatus(ctx context.Context, userID int64, deviceID string, disabled bool) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE devices SET disabled = ? WHERE user_id = ? AND device_id = ?`,
@@ -234,7 +243,24 @@ func (s *MySQLStore) UpdateDeviceStatus(ctx context.Context, userID int64, devic
 		return fmt.Errorf("更新设备状态失败: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrDeviceNotFound
+		exists, err := s.deviceExists(ctx, userID, deviceID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrDeviceNotFound
+		}
 	}
 	return nil
+}
+
+// deviceExists 判断指定 user_id + device_id 的设备是否存在。
+func (s *MySQLStore) deviceExists(ctx context.Context, userID int64, deviceID string) (bool, error) {
+	var cnt int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM devices WHERE user_id = ? AND device_id = ?`,
+		userID, deviceID).Scan(&cnt); err != nil {
+		return false, fmt.Errorf("查询设备是否存在失败: %w", err)
+	}
+	return cnt > 0, nil
 }
