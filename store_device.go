@@ -128,6 +128,7 @@ func (s *MySQLStore) ListDevices(ctx context.Context, userID int64) ([]*Device, 
 // DeviceFilter 设备列表搜索条件。零值表示不限制。
 type DeviceFilter struct {
 	Keyword  string // 模糊匹配 username / device_id / name / last_ip
+	UserID   int64  // > 0 时只查该用户
 	Disabled *bool  // 禁用状态过滤
 	Offset   int
 	Limit    int
@@ -156,6 +157,10 @@ func (s *MySQLStore) ListAllDevices(ctx context.Context, f DeviceFilter) ([]*Dev
 		} else {
 			args = append(args, 0)
 		}
+	}
+	if f.UserID > 0 {
+		where += " AND d.user_id = ?"
+		args = append(args, f.UserID)
 	}
 
 	var total int64

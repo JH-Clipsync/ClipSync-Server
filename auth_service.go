@@ -169,11 +169,25 @@ func ValidateUsername(name string) error {
 }
 
 // Register 注册新用户。是否开放由 auth.allow_register 控制。
+// 自助注册不填昵称，默认空，用户可在客户端自行设置。
 func (a *AuthService) Register(ctx context.Context, username, password string) (*User, error) {
 	if !a.cfg.AllowRegister {
 		return nil, ErrRegisterClosed
 	}
+	return a.register(ctx, username, "", password)
+}
+
+// AdminCreateUser 管理端创建用户：不需要 auth.allow_register 开关，可指定昵称。
+func (a *AuthService) AdminCreateUser(ctx context.Context, username, nickname, password string) (*User, error) {
+	return a.register(ctx, username, nickname, password)
+}
+
+func (a *AuthService) register(ctx context.Context, username, nickname, password string) (*User, error) {
 	username = strings.TrimSpace(username)
+	nickname = strings.TrimSpace(nickname)
+	if len([]rune(nickname)) > 32 {
+		return nil, fmt.Errorf("昵称不能超过 32 个字符")
+	}
 	if err := ValidateUsername(username); err != nil {
 		return nil, err
 	}
@@ -184,7 +198,7 @@ func (a *AuthService) Register(ctx context.Context, username, password string) (
 	if err != nil {
 		return nil, err
 	}
-	return a.db.CreateUser(ctx, username, hash)
+	return a.db.CreateUser(ctx, username, nickname, hash)
 }
 
 // Login 用用户名 + 密码换 token，这是"手填 token"被替换掉的入口。
@@ -408,7 +422,7 @@ func bootstrapUser(db *MySQLStore, cfg AuthConfig) {
 		logWarn("⚠ 初始账号密码哈希失败: %v", err)
 		return
 	}
-	if _, err := db.CreateUser(ctx, cfg.BootstrapUser, hash); err != nil {
+	if _, err := db.CreateUser(ctx, cfg.BootstrapUser, "", hash); err != nil {
 		logWarn("⚠ 创建初始账号失败: %v", err)
 		return
 	}

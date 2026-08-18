@@ -1290,6 +1290,7 @@ func main() {
 	mux.HandleFunc("/auth/change-password", changePasswordHandler)
 
 	// 管理端 HTTP 接口（走 admin_token 鉴权，与 Redis Pub/Sub 形成双保险）
+	mux.HandleFunc("POST /server-admin/users", requireAdminToken(adminCreateUser))
 	mux.HandleFunc("GET /server-admin/devices", requireAdminToken(adminListAllDevices))
 	mux.HandleFunc("GET /server-admin/users/{id}/devices", requireAdminToken(adminListDevices))
 	mux.HandleFunc("PUT /server-admin/users/{id}/devices/{deviceID}/status", requireAdminToken(adminSetDeviceStatus))

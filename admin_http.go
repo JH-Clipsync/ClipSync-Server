@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -25,27 +26,53 @@ type adminDeviceResponse struct {
 	CreatedAt  string `json:"created_at"`
 }
 
-// requireAdminToken 校验 Authorization: Bearer <token>。
-// 配置里没填 admin_token 时返回 503（HTTP 兜底通道未启用），
-// 配了但 token 不对返回 401。正常情况下管理端指令走 Redis Pub/Sub，
-// 这里的 HTTP 接口只是兜底，不配 admin_token 不影响主流程。
-func requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
+func requireAdminToken(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		want := ""
-		if globalConfig != nil {
-			want = globalConfig.Server.AdminToken
-		}
-		if want == "" {
+		if globalConfig.Server.AdminToken == "" {
 			http.Error(w, "服务端未配置 admin_token，管理接口不可用", http.StatusServiceUnavailable)
 			return
 		}
-		got := r.Header.Get("Authorization")
-		if !strings.HasPrefix(got, "Bearer ") || got[len("Bearer "):] != want {
+		tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(globalConfig.Server.AdminToken)) != 1 {
 			http.Error(w, "未授权", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
+		h(w, r)
 	}
+}
+
+// ==================== 管理端 HTTP 接口（供 ClipSync-Admin HTTP 兜底调用） ====================
+
+type adminCreateUserReq struct {
+	Username string `json:"username"`
+	Nickname string `json:"nickname"`
+	Password string `json:"password"`
+}
+
+// adminCreateUser POST /server-admin/users
+// 管理端创建用户：不走 auth.allow_register 开关，密码用 Server 端 bcrypt 哈希。
+func adminCreateUser(w http.ResponseWriter, r *http.Request) {
+	var body adminCreateUserReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "请求体不合法", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	user, err := authService.AdminCreateUser(ctx, body.Username, body.Nickname, body.Password)
+	if err != nil {
+		if errors.Is(err, ErrUserExists) {
+			http.Error(w, "用户名已存在", http.StatusConflict)
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":       user.ID,
+		"username": user.Username,
+		"nickname": user.Nickname,
+	})
 }
 
 // writeJSONAdmin 与 auth_http.go 中统一 JSON 响应同名，这里直接复用。
@@ -108,6 +135,9 @@ func adminListAllDevices(w http.ResponseWriter, r *http.Request) {
 		Keyword: q.Get("keyword"),
 		Offset:  (page - 1) * pageSize,
 		Limit:   pageSize,
+	}
+	if uid, _ := strconv.ParseInt(q.Get("user_id"), 10, 64); uid > 0 {
+		f.UserID = uid
 	}
 	switch strings.ToLower(q.Get("disabled")) {
 	case "true":

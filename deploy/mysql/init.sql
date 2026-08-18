@@ -13,6 +13,7 @@ USE clipsync;
 CREATE TABLE IF NOT EXISTS users (
   id            BIGINT       NOT NULL AUTO_INCREMENT,
   username      VARCHAR(64)  NOT NULL,
+  nickname      VARCHAR(64)  NOT NULL DEFAULT '',
   password_hash VARCHAR(255) NOT NULL,
   disabled      TINYINT(1)   NOT NULL DEFAULT 0,
   created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,

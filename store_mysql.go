@@ -16,6 +16,7 @@ import (
 type User struct {
 	ID           int64
 	Username     string
+	Nickname     string
 	PasswordHash string
 	Disabled     bool
 	CreatedAt    time.Time
@@ -81,6 +82,7 @@ func (s *MySQLStore) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS users (
 			id            BIGINT       NOT NULL AUTO_INCREMENT,
 			username      VARCHAR(64)  NOT NULL,
+			nickname      VARCHAR(64)  NOT NULL DEFAULT '',
 			password_hash VARCHAR(255) NOT NULL,
 			disabled      TINYINT(1)   NOT NULL DEFAULT 0,
 			created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -88,6 +90,8 @@ func (s *MySQLStore) migrate(ctx context.Context) error {
 			PRIMARY KEY (id),
 			UNIQUE KEY uk_users_username (username)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		// 兼容旧库：若 users 表已存在但没有 nickname 列，自动补上。
+		`ALTER TABLE users ADD COLUMN nickname VARCHAR(64) NOT NULL DEFAULT '' AFTER username`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			user_id    BIGINT      NOT NULL,
 			token_hash CHAR(64)    NOT NULL,
@@ -101,6 +105,11 @@ func (s *MySQLStore) migrate(ctx context.Context) error {
 	}
 	for _, q := range stmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			// ADD COLUMN 在新库（CREATE TABLE 已带该列）上会报 1060 重复列名，忽略
+			var me *mysql.MySQLError
+			if errors.As(err, &me) && me.Number == 1060 {
+				continue
+			}
 			return fmt.Errorf("初始化表结构失败: %w", err)
 		}
 	}
@@ -112,10 +121,10 @@ func (s *MySQLStore) migrate(ctx context.Context) error {
 }
 
 // CreateUser 注册。用户名唯一冲突时返回 ErrUserExists。
-func (s *MySQLStore) CreateUser(ctx context.Context, username, passwordHash string) (*User, error) {
+func (s *MySQLStore) CreateUser(ctx context.Context, username, nickname, passwordHash string) (*User, error) {
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (username, password_hash) VALUES (?, ?)`,
-		username, passwordHash)
+		`INSERT INTO users (username, nickname, password_hash) VALUES (?, ?, ?)`,
+		username, nickname, passwordHash)
 	if err != nil {
 		var me *mysql.MySQLError
 		if errors.As(err, &me) && me.Number == 1062 {
@@ -124,7 +133,7 @@ func (s *MySQLStore) CreateUser(ctx context.Context, username, passwordHash stri
 		return nil, fmt.Errorf("创建用户失败: %w", err)
 	}
 	id, _ := res.LastInsertId()
-	return &User{ID: id, Username: username, PasswordHash: passwordHash, CreatedAt: time.Now()}, nil
+	return &User{ID: id, Username: username, Nickname: nickname, PasswordHash: passwordHash, CreatedAt: time.Now()}, nil
 }
 
 // FindUserByName 按用户名查，找不到返回 ErrUserNotFound。
@@ -132,8 +141,8 @@ func (s *MySQLStore) FindUserByName(ctx context.Context, username string) (*User
 	var u User
 	var disabled int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, disabled, created_at FROM users WHERE username = ?`,
-		username).Scan(&u.ID, &u.Username, &u.PasswordHash, &disabled, &u.CreatedAt)
+		`SELECT id, username, nickname, password_hash, disabled, created_at FROM users WHERE username = ?`,
+		username).Scan(&u.ID, &u.Username, &u.Nickname, &u.PasswordHash, &disabled, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
@@ -149,8 +158,8 @@ func (s *MySQLStore) FindUserByID(ctx context.Context, userID int64) (*User, err
 	var u User
 	var disabled int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, disabled, created_at FROM users WHERE id = ?`,
-		userID).Scan(&u.ID, &u.Username, &u.PasswordHash, &disabled, &u.CreatedAt)
+		`SELECT id, username, nickname, password_hash, disabled, created_at FROM users WHERE id = ?`,
+		userID).Scan(&u.ID, &u.Username, &u.Nickname, &u.PasswordHash, &disabled, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
@@ -199,10 +208,10 @@ func (s *MySQLStore) FindUserByTokenHash(ctx context.Context, tokenHash string) 
 	var u User
 	var disabled int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT u.id, u.username, u.password_hash, u.disabled, u.created_at
+		`SELECT u.id, u.username, u.nickname, u.password_hash, u.disabled, u.created_at
 		   FROM sessions s JOIN users u ON u.id = s.user_id
 		  WHERE s.token_hash = ? AND s.expires_at > NOW()`,
-		tokenHash).Scan(&u.ID, &u.Username, &u.PasswordHash, &disabled, &u.CreatedAt)
+		tokenHash).Scan(&u.ID, &u.Username, &u.Nickname, &u.PasswordHash, &disabled, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
