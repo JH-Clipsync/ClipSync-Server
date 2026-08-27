@@ -575,11 +575,22 @@ func (c *Client) readPump() {
 			readDeadline = time.Duration(globalConfig.WebSocket.ReadDeadlineSec) * time.Second
 		}
 	}
+	writeDeadline := 10 * time.Second
+	if globalConfig != nil && globalConfig.WebSocket.WriteDeadlineSec > 0 {
+		writeDeadline = time.Duration(globalConfig.WebSocket.WriteDeadlineSec) * time.Second
+	}
+	refreshDeadline := func() { c.conn.SetReadDeadline(time.Now().Add(readDeadline)) }
 	c.conn.SetReadLimit(readLimit) // 剪贴板图片可能大
-	c.conn.SetReadDeadline(time.Now().Add(readDeadline))
-	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(readDeadline))
-		return nil
+	refreshDeadline()
+	// 任何入站帧都说明客户端存活，都续期读超时：
+	// Pong（服务端主动 Ping 的回应）/ Ping（Mac URLSessionWebSocketTask 每 20s 主动发）/ 数据帧（Windows 应用层心跳）。
+	// 否则只靠 Pong 续期时，主动发 Ping 但不回 Pong 的客户端（Mac）会在 readDeadline 后被误杀。
+	c.conn.SetPongHandler(func(string) error { refreshDeadline(); return nil })
+	c.conn.SetPingHandler(func(appData string) error {
+		refreshDeadline()
+		// 默认行为：回一帧 Pong（控制帧允许在 readPump 上直接写）
+		c.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+		return c.conn.WriteMessage(websocket.PongMessage, []byte(appData))
 	})
 	for {
 		_, data, err := c.conn.ReadMessage()
@@ -587,6 +598,7 @@ func (c *Client) readPump() {
 			// 网络断开是正常事件，不作为错误级别打印
 			return
 		}
+		refreshDeadline() // 收到数据帧同样视为存活
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
 			logError("✗ 消息解析失败: %v", err)
