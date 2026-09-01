@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -96,6 +97,15 @@ type Client struct {
 	//   sms_in   = 本机短信会同步上行（通常只有 Android 有）
 	//   auto_put = 收到远端剪贴板会自动写入本机剪贴板
 	caps map[string]bool
+
+	// replaced 标记该连接已被同 deviceID 的新连接顶替。
+	// 旧连接随后被 close 并在 unregister 时摘除；wsHandler 退出时
+	// 不再对它执行 MarkOffline，避免误删新连接刚写入的 Redis 在线登记。
+	replaced atomic.Bool
+
+	// closeOnce 保证 send channel 全局只关闭一次，避免多条收尾路径
+	// （正常断开 / 被顶替 / 管理端踢下线）重复 close 触发 panic。
+	closeOnce sync.Once
 }
 
 // globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
@@ -124,6 +134,21 @@ var upgrader = websocket.Upgrader{
 
 func (h *Hub) register(c *Client) {
 	h.mu.Lock()
+	// 同设备重连兜底：重连风暴时旧连接可能还挂在 hub 里（等读超时才死），
+	// 若不收掉它，presence 广播里同一 deviceID 会出现两次，可能导致客户端崩溃。
+	// 这里直接摘除并关闭同 deviceID 的旧连接；它们随后走 unregister 收尾。
+	var stale []*Client
+	for old := range h.clients[c.userID] {
+		if old.deviceID == c.deviceID {
+			stale = append(stale, old)
+		}
+	}
+	for _, old := range stale {
+		delete(h.clients[c.userID], old)
+		old.replaced.Store(true)
+		logInfo("♻️ 顶替旧连接: %s (%s) user=%d ip=%s — 同设备新连接上线，收掉残留连接",
+			shortID(c.deviceID), c.role, c.userID, old.ip)
+	}
 	if _, ok := h.clients[c.userID]; !ok {
 		h.clients[c.userID] = make(map[*Client]bool)
 	}
@@ -131,6 +156,11 @@ func (h *Hub) register(c *Client) {
 	logInfo("🟢 上线: %s (%s) user=%d token=%s ip=%s — 该组在线 %d 台",
 		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip, len(h.clients[c.userID]))
 	h.mu.Unlock()
+	// 关闭放在锁外：close 会让旧连接的 readPump 报错退出，进而回调 unregister
+	// （unregister 自带幂等，届时这些连接已不在 set 里，不会重复操作）。
+	for _, old := range stale {
+		_ = old.conn.Close()
+	}
 	// 上线后向该组所有连接广播最新在线列表
 	h.broadcastPresence(c.userID)
 }
@@ -143,12 +173,23 @@ func (h *Hub) unregister(c *Client) {
 			delete(h.clients, c.userID)
 		}
 	}
-	close(c.send)
-	logInfo("⚪ 下线: %s (%s) user=%d token=%s ip=%s",
-		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
+	// 幂等兜底：send channel 全局只关闭一次（sync.Once）。
+	// 被顶替的旧连接即使已不在 set 里，也要关掉 send 让 writePump 立即退出，
+	// 不必干等到下一次 ping tick；重复收尾时 Do 自动忽略后续调用。
+	c.closeOnce.Do(func() { close(c.send) })
+	if c.replaced.Load() {
+		logInfo("⚪ 旧连接收尾: %s (%s) user=%d（已被同设备新连接顶替）",
+			shortID(c.deviceID), c.role, c.userID)
+	} else {
+		logInfo("⚪ 下线: %s (%s) user=%d token=%s ip=%s",
+			shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
+	}
 	h.mu.Unlock()
-	// 下线后向该组剩余连接广播最新在线列表
-	h.broadcastPresence(c.userID)
+	// 被顶替的旧连接不触发 presence 广播：它早已被摘出 set，
+	// register 时已广播过最终列表，无需再用"旧视角"重复推一遍。
+	if !c.replaced.Load() {
+		h.broadcastPresence(c.userID)
+	}
 }
 
 // onlineDevice 在线列表里的单台设备信息，序列化成 presence 消息 payload。
@@ -161,16 +202,6 @@ type onlineDevice struct {
 	OnlineAt int64          `json:"online_at"` // 毫秒时间戳
 	Self     bool           `json:"self"`      // 是否为接收这条消息的设备本身
 	Caps     map[string]bool `json:"caps"`     // 客户端能力/同步开关
-}
-
-// snapshotDevices 在持锁状态下拷贝某用户的在线设备列表，避免遍历时并发修改。
-func (h *Hub) snapshotDevicesLocked(userID int64) []*Client {
-	set := h.clients[userID]
-	list := make([]*Client, 0, len(set))
-	for c := range set {
-		list = append(list, c)
-	}
-	return list
 }
 
 // onlineDeviceIDs 返回某用户当前在内存 hub 中的在线 deviceID 集合。
@@ -218,18 +249,47 @@ func (h *Hub) renameDevice(userID int64, deviceID, name string) {
 
 // broadcastPresence 把某账号当前的在线设备列表推给该组所有连接。
 // 在 register/unregister 后调用，让客户端实时刷新"在线设备"UI。
+//
+// 双重兜底：
+//  1. 正常情况下 register 已经把同 deviceID 的残留旧连接收掉，set 里不应再有重复；
+//  2. 这里仍按 deviceID 再去一次重，同 ID 只保留最新连接（onlineAt 最晚），
+//     保证广播出去的 devices 永远不会出现重复设备——某些客户端遇到重复 ID 会直接崩溃。
+//
+// 另外，发送动作放在持锁期间进行：旧实现"先解锁再发"，期间连接若被 unregister
+// 关掉 send channel，向已关闭 channel 发送会 panic。持锁发送可杜绝该竞态
+// （channel 带 32 缓冲且非阻塞发送，锁占用时间极短）。
 func (h *Hub) broadcastPresence(userID int64) {
 	h.mu.RLock()
-	targets := h.snapshotDevicesLocked(userID)
-	h.mu.RUnlock()
-	if len(targets) == 0 {
+	defer h.mu.RUnlock()
+	set := h.clients[userID]
+	if len(set) == 0 {
 		return
 	}
-	for _, c := range targets {
-		h.mu.RLock()
-		devices := make([]onlineDevice, 0, len(h.clients[userID]))
-		for other := range h.clients[userID] {
-			devices = append(devices, onlineDevice{
+	// 按 deviceID 去重，保留 onlineAt 最晚的连接
+	byDevice := make(map[string]*Client, len(set))
+	dup := 0
+	for c := range set {
+		if keep, ok := byDevice[c.deviceID]; ok {
+			dup++
+			if c.onlineAt.After(keep.onlineAt) {
+				byDevice[c.deviceID] = c
+			}
+			continue
+		}
+		byDevice[c.deviceID] = c
+	}
+	if dup > 0 {
+		logWarn("⚠ presence 去重：user=%d 发现 %d 个重复 deviceID 连接，已只保留最新", userID, dup)
+	}
+	devices := make([]*Client, 0, len(byDevice))
+	for _, c := range byDevice {
+		devices = append(devices, c)
+	}
+	// 序列化放锁外会让 self 标记与发送之间产生竞态；列表不大，直接持锁逐台组装发送
+	for _, c := range devices {
+		list := make([]onlineDevice, 0, len(devices))
+		for _, other := range devices {
+			list = append(list, onlineDevice{
 				DeviceID: other.deviceID,
 				Role:     other.role,
 				Platform: other.platform,
@@ -240,9 +300,8 @@ func (h *Hub) broadcastPresence(userID int64) {
 				Caps:     other.caps,
 			})
 		}
-		h.mu.RUnlock()
 		payload, _ := json.Marshal(map[string]any{
-			"devices": devices,
+			"devices": list,
 		})
 		msg, _ := json.Marshal(Message{
 			ID:      "presence",
@@ -957,6 +1016,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	regCancel()
 	defer func() {
+		// 被同设备新连接顶替的旧连接不能执行 MarkOffline：
+		// Redis 的在线登记按 deviceID 存储，旧连接 HDel 会把新连接刚写入的
+		// 在线字段一并删掉，导致"实际在线但登录接口判断离线"。新连接自己
+		// 的 keepOnline 会持续续期，断开时再由它负责清理。
+		if client.replaced.Load() {
+			return
+		}
 		offCtx, offCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := authGate.MarkOffline(offCtx, userID, device); err != nil {
 			logWarn("⚠ 在线登记清理失败: %v", err)
