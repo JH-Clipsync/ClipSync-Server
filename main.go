@@ -669,10 +669,22 @@ func (c *Client) readPump() {
 		// 强制覆盖 from，防止客户端伪造
 		msg.From = c.deviceID
 
-		// 忽略客户端发来的控制消息（心跳、伪造的 presence），不转发也不记录
+		// 控制消息处理（心跳、伪造的 presence），不转发也不记录
 		// Windows 端会发应用层 {"type":"ping"} 心跳；presence 只允许服务端下发
 		switch msg.Type {
-		case "ping", "pong", TypePresence:
+		case "pong", TypePresence:
+			continue
+		case "ping":
+			// 回一帧 pong 给发送方：手机端用它判断上行/下行链路是否双向通畅，
+			// 用来在 Doze 后台检测"半开连接"（连接看似在线但数据已发不出去）。
+			// 旧客户端不认识 pong，JSON 解析失败会安全忽略，无副作用。
+			if pong, err := json.Marshal(Message{Type: "pong", TS: time.Now().Unix()}); err == nil {
+				select {
+				case c.send <- pong:
+				default:
+					msgLog.Printf("  ⚠ pong 丢弃：%s 队列已满", shortID(c.deviceID))
+				}
+			}
 			continue
 		}
 
