@@ -119,8 +119,12 @@ type Client struct {
 }
 
 // offlineGrace 下线宽限时长：连接断开后保留 presence 的窗口。
-// 期间同设备重连则完全静默；超过此时长仍未回来才真正广播下线。
-const offlineGrace = 10 * time.Second
+// 只需覆盖"旧连接关闭(RST/FIN 亚秒到达) → 同设备新连接 register"的 gap：
+// App 重启冷启动 + 看门狗/退避重连通常在 1~4 秒内完成，5 秒足以覆盖；
+// 再长会让真实下线（关机/离开网络）的提示明显滞后，故不取 10s。
+// 宽限期内重连则完全静默；超过此时长仍未回来才真正广播下线，
+// 之后设备再回来时上线提示由客户端去抖抑制。
+const offlineGrace = 5 * time.Second
 
 // globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
 var globalConfig *Config
