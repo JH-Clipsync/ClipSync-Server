@@ -103,10 +103,24 @@ type Client struct {
 	// 不再对它执行 MarkOffline，避免误删新连接刚写入的 Redis 在线登记。
 	replaced atomic.Bool
 
+	// grace 标记该连接已断开、正处于"下线宽限"等待期：
+	// App 重启/网络抖动/Doze 唤醒会让连接秒级断开又重连，若断开即广播下线，
+	// 其他端会先收到"下线"再收到"上线"，形成"莫名其妙上下线"的骚扰。
+	// 宽限态连接仍留在 hub.clients 集合里（所以 presence 视角它从未离开），
+	// 但不参与消息路由、不再续 Redis；宽限期内同设备重连会顶替它并取消定时器，
+	// 全程不广播；宽限期结束仍未回来才真正摘除并广播下线。
+	grace atomic.Bool
+	// graceTimer 宽限期结束后的摘除定时器；重连顶替时 Stop 掉即可静默。
+	graceTimer *time.Timer
+
 	// closeOnce 保证 send channel 全局只关闭一次，避免多条收尾路径
 	// （正常断开 / 被顶替 / 管理端踢下线）重复 close 触发 panic。
 	closeOnce sync.Once
 }
+
+// offlineGrace 下线宽限时长：连接断开后保留 presence 的窗口。
+// 期间同设备重连则完全静默；超过此时长仍未回来才真正广播下线。
+const offlineGrace = 10 * time.Second
 
 // globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
 var globalConfig *Config
@@ -134,20 +148,35 @@ var upgrader = websocket.Upgrader{
 
 func (h *Hub) register(c *Client) {
 	h.mu.Lock()
-	// 同设备重连兜底：重连风暴时旧连接可能还挂在 hub 里（等读超时才死），
-	// 若不收掉它，presence 广播里同一 deviceID 会出现两次，可能导致客户端崩溃。
-	// 这里直接摘除并关闭同 deviceID 的旧连接；它们随后走 unregister 收尾。
+	// 同设备重连兜底：重连风暴时旧连接可能还挂在 hub 里（等读超时才死，
+	// 或正处于"下线宽限"等待期），若不收掉它，presence 广播里同一 deviceID
+	// 会出现两次，可能导致客户端崩溃。这里直接摘除并关闭同 deviceID 的旧连接。
 	var stale []*Client
+	replacedGrace := false
 	for old := range h.clients[c.userID] {
 		if old.deviceID == c.deviceID {
 			stale = append(stale, old)
+			if old.grace.Load() {
+				replacedGrace = true
+			}
 		}
 	}
 	for _, old := range stale {
 		delete(h.clients[c.userID], old)
 		old.replaced.Store(true)
-		logInfo("♻️ 顶替旧连接: %s (%s) user=%d ip=%s — 同设备新连接上线，收掉残留连接",
-			shortID(c.deviceID), c.role, c.userID, old.ip)
+		// 旧连接若处于下线宽限期：取消到期摘除定时器，本次重连完全静默——
+		// 其他端的 presence 视角里该设备从未离开过，不该收到任何上下线提示。
+		if old.graceTimer != nil {
+			old.graceTimer.Stop()
+			old.graceTimer = nil
+		}
+		if old.grace.Load() {
+			logInfo("🔁 宽限内重连: %s (%s) user=%d ip=%s — 设备短暂断线后恢复，静默顶替",
+				shortID(c.deviceID), c.role, c.userID, c.ip)
+		} else {
+			logInfo("♻️ 顶替旧连接: %s (%s) user=%d ip=%s — 同设备新连接上线，收掉残留连接",
+				shortID(c.deviceID), c.role, c.userID, old.ip)
+		}
 	}
 	if _, ok := h.clients[c.userID]; !ok {
 		h.clients[c.userID] = make(map[*Client]bool)
@@ -161,35 +190,66 @@ func (h *Hub) register(c *Client) {
 	for _, old := range stale {
 		_ = old.conn.Close()
 	}
-	// 上线后向该组所有连接广播最新在线列表
-	h.broadcastPresence(c.userID)
+	// 若只是顶替宽限期内的同设备连接，在线列表对其他端而言没有变化（该设备一直
+	// 在列表里），无需广播 presence；新连接自身也会在握手后收到一次 presence
+	// （renameDevice / 其他上下线时自然带上），这里静默即可，避免任何"上线"提示。
+	if !replacedGrace {
+		// 上线后向该组所有连接广播最新在线列表
+		h.broadcastPresence(c.userID)
+	}
 }
 
 func (h *Hub) unregister(c *Client) {
 	h.mu.Lock()
-	if set, ok := h.clients[c.userID]; ok {
-		delete(set, c)
-		if len(set) == 0 {
-			delete(h.clients, c.userID)
-		}
-	}
 	// 幂等兜底：send channel 全局只关闭一次（sync.Once）。
 	// 被顶替的旧连接即使已不在 set 里，也要关掉 send 让 writePump 立即退出，
 	// 不必干等到下一次 ping tick；重复收尾时 Do 自动忽略后续调用。
 	c.closeOnce.Do(func() { close(c.send) })
+
+	// 已被顶替（含宽限期内重连顶替）：register 已把它从 set 摘除，这里只做日志。
 	if c.replaced.Load() {
+		h.mu.Unlock()
 		logInfo("⚪ 旧连接收尾: %s (%s) user=%d（已被同设备新连接顶替）",
 			shortID(c.deviceID), c.role, c.userID)
-	} else {
-		logInfo("⚪ 下线: %s (%s) user=%d token=%s ip=%s",
-			shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
+		return
 	}
+
+	// 正常断开：不立刻从 set 摘除，进入下线宽限期。
+	// 连接留在 set 里，presence 视角该设备仍在线（它本来就是"即将可能重连"状态），
+	// 但标记 grace：不参与消息路由、不续 Redis、不会收到任何下行帧。
+	c.grace.Store(true)
+	logInfo("🟡 断开待确认: %s (%s) user=%d token=%s ip=%s — 进入 %v 下线宽限",
+		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip, offlineGrace)
+
+	// 排定宽限期结束后的真正摘除：到期仍未被新连接顶替，才下线并广播。
+	// 定时器在 register 顶替（含宽限内重连）时会被 Stop 掉。
+	c.graceTimer = time.AfterFunc(offlineGrace, func() { h.finalizeGrace(c) })
 	h.mu.Unlock()
-	// 被顶替的旧连接不触发 presence 广播：它早已被摘出 set，
-	// register 时已广播过最终列表，无需再用"旧视角"重复推一遍。
-	if !c.replaced.Load() {
-		h.broadcastPresence(c.userID)
+}
+
+// finalizeGrace 下线宽限期结束：若连接仍处于 grace 且仍在 set 中（说明期间没有
+// 同设备新连接顶替），才真正摘除并广播下线；否则说明已被顶替，静默跳过。
+func (h *Hub) finalizeGrace(c *Client) {
+	h.mu.Lock()
+	if c.replaced.Load() || !c.grace.Load() {
+		h.mu.Unlock()
+		return
 	}
+	if set, ok := h.clients[c.userID]; ok {
+		if _, exists := set[c]; exists {
+			delete(set, c)
+			if len(set) == 0 {
+				delete(h.clients, c.userID)
+			}
+		}
+	}
+	c.grace.Store(false)
+	c.graceTimer = nil
+	logInfo("⚪ 下线: %s (%s) user=%d token=%s ip=%s（宽限期结束确认离线）",
+		shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
+	h.mu.Unlock()
+	// 此时才向该组广播一次"设备已离开"的 presence
+	h.broadcastPresence(c.userID)
 }
 
 // onlineDevice 在线列表里的单台设备信息，序列化成 presence 消息 payload。
@@ -265,18 +325,27 @@ func (h *Hub) broadcastPresence(userID int64) {
 	if len(set) == 0 {
 		return
 	}
-	// 按 deviceID 去重，保留 onlineAt 最晚的连接
+	// 按 deviceID 去重，保留 onlineAt 最晚的连接；活跃连接永远优先于宽限占位连接。
+	// 下线宽限期内的连接仍留在 set 里（对其他端展示为在线，避免误报"下线"），
+	// 但它 send channel 已关闭，后面发送阶段会跳过，不会成为 presence 接收方。
 	byDevice := make(map[string]*Client, len(set))
 	dup := 0
 	for c := range set {
-		if keep, ok := byDevice[c.deviceID]; ok {
-			dup++
+		keep, exists := byDevice[c.deviceID]
+		if !exists {
+			byDevice[c.deviceID] = c
+			continue
+		}
+		dup++
+		if c.grace.Load() == keep.grace.Load() {
 			if c.onlineAt.After(keep.onlineAt) {
 				byDevice[c.deviceID] = c
 			}
-			continue
+		} else if !c.grace.Load() {
+			// c 活跃、keep 宽限 → 用活跃的
+			byDevice[c.deviceID] = c
 		}
-		byDevice[c.deviceID] = c
+		// else: c 宽限、keep 活跃 → 保留活跃的
 	}
 	if dup > 0 {
 		logWarn("⚠ presence 去重：user=%d 发现 %d 个重复 deviceID 连接，已只保留最新", userID, dup)
@@ -285,8 +354,16 @@ func (h *Hub) broadcastPresence(userID int64) {
 	for _, c := range byDevice {
 		devices = append(devices, c)
 	}
-	// 序列化放锁外会让 self 标记与发送之间产生竞态；列表不大，直接持锁逐台组装发送
+	// 序列化放锁外会让 self 标记与发送之间产生竞态；列表不大，直接持锁逐台组装发送。
+	// 接收方只给活跃连接：宽限连接 send channel 已关闭，绝不能向它发帧（向已关闭
+	// channel 发送会 panic）；它作为设备仍出现在别人的列表里（占位展示），只是不收消息。
+	receivers := make([]*Client, 0, len(devices))
 	for _, c := range devices {
+		if !c.grace.Load() {
+			receivers = append(receivers, c)
+		}
+	}
+	for _, c := range receivers {
 		list := make([]onlineDevice, 0, len(devices))
 		for _, other := range devices {
 			list = append(list, onlineDevice{
@@ -356,6 +433,10 @@ func (h *Hub) kickUser(userID int64, reason string) int {
 	set := h.clients[userID]
 	targets := make([]*Client, 0, len(set))
 	for c := range set {
+		// 宽限连接 socket 已死，踢了也没意义，跳过
+		if c.grace.Load() {
+			continue
+		}
 		targets = append(targets, c)
 	}
 	h.mu.RUnlock()
@@ -379,6 +460,9 @@ func (h *Hub) kickDevice(userID int64, deviceID, reason string) int {
 	set := h.clients[userID]
 	targets := make([]*Client, 0, 1)
 	for c := range set {
+		if c.grace.Load() {
+			continue
+		}
 		if c.deviceID == deviceID {
 			targets = append(targets, c)
 		}
@@ -596,7 +680,14 @@ func (h *Hub) route(sender *Client, msgType string, raw []byte) {
 	wantRole := targetRoleForType(msgType)
 
 	dispatched := 0
+	onlineCount := 0
 	for c := range targets {
+		// 下线宽限期内的连接：socket 已死、send channel 已关闭，
+		// 绝不能作为转发目标（向已关闭 channel 发帧会 panic），也不计入在线数。
+		if c.grace.Load() {
+			continue
+		}
+		onlineCount++
 		// 铁律 1：永远不发回给自己
 		if c == sender {
 			continue
@@ -615,7 +706,7 @@ func (h *Hub) route(sender *Client, msgType string, raw []byte) {
 	if dispatched > 0 {
 		msgLog.Printf("  → 已转发到 %d 台设备", dispatched)
 	} else {
-		msgLog.Printf("  ⏸ 无接收方（同组在线 %d 台）", len(targets))
+		msgLog.Printf("  ⏸ 无接收方（同组在线 %d 台）", onlineCount)
 	}
 }
 
@@ -1071,8 +1162,11 @@ func (c *Client) keepOnline(ttl time.Duration) {
 	for range ticker.C {
 		hub.mu.RLock()
 		_, alive := hub.clients[c.userID][c]
+		// 宽限态连接虽仍在 set 里，但已断开、不应再给 Redis 在线登记续期，
+		// 否则登录接口会在宽限期内把它误判为在线。
+		inGrace := c.grace.Load()
 		hub.mu.RUnlock()
-		if !alive {
+		if !alive || inGrace {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1183,7 +1277,13 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 	hub.mu.RLock()
 	targets := hub.clients[userID]
 	dispatched := 0
+	onlineTotal := 0
 	for c := range targets {
+		// 宽限连接已断开，跳过（send channel 已关闭，发送会 panic）
+		if c.grace.Load() {
+			continue
+		}
+		onlineTotal++
 		wantRole := targetRoleForType(body.Type)
 		if wantRole != "*" && c.role != wantRole {
 			continue
@@ -1194,23 +1294,22 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 	}
-	total := len(targets)
 	hub.mu.RUnlock()
 
-	logInfo("↑ /push %s (kind=%s) → 转发到 %d/%d 台", body.Type, body.Kind, dispatched, total)
+	logInfo("↑ /push %s (kind=%s) → 转发到 %d/%d 台", body.Type, body.Kind, dispatched, onlineTotal)
 	// 消息推送流水另外写到消息日志，格式跟 WebSocket 通道一致（内容为主，元数据为辅）
 	msgLog.Printf("↑ 收到「%s」 [%s·%s·%s] from=http-push user=%d token=%s ip=%s → 转发到 %d/%d 台",
 		body.Preview,
 		zhCategory(categorize(body.Type, body.Kind)),
 		zhContent(contentTypeOf(body.Kind, body.Mime)),
 		zhPush(body.Type),
-		userID, shortToken(token), extractIP(r), dispatched, total)
+		userID, shortToken(token), extractIP(r), dispatched, onlineTotal)
 
 	w.Header().Set("Content-Type", "application/json")
 	resp, _ := json.Marshal(map[string]any{
 		"ok":         true,
 		"dispatched": dispatched,
-		"total":      total,
+		"total":      onlineTotal,
 		"msg_id":     msgID,
 	})
 	w.Write(resp)
