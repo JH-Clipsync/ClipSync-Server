@@ -200,6 +200,11 @@ func (h *Hub) register(c *Client) {
 	if !replacedGrace {
 		// 上线后向该组所有连接广播最新在线列表
 		h.broadcastPresence(c.userID)
+	} else {
+		// 宽限内同设备静默重连：不向全组广播（避免误报“上线”），
+		// 但新连接自身必须立刻拿到一次当前列表——否则在下次别的设备上下线之前，
+		// 它永远收不到 presence，在线设备 UI 会一直停在加载态（快速重启 App 必现）。
+		h.sendPresenceTo(c)
 	}
 }
 
@@ -397,6 +402,76 @@ func (h *Hub) broadcastPresence(userID int64) {
 			logWarn("⚠ presence 推送丢弃：%s 队列已满", shortID(c.deviceID))
 		}
 	}
+}
+
+// sendPresenceTo 只给单个连接补发一次该用户当前的在线列表（不向全组广播）。
+// 用于宽限期内同设备静默重连：全组视角无变化、不该收到上下线提示，
+// 但新连接自身必须立刻拿到列表，否则在线设备 UI 会一直加载到下次别的设备变动。
+func (h *Hub) sendPresenceTo(target *Client) {
+	if target == nil || target.grace.Load() {
+		return
+	}
+	msg := h.buildPresenceMsg(target.userID, target)
+	if msg == nil {
+		return
+	}
+	select {
+	case target.send <- msg:
+	default:
+		logWarn("⚠ presence 补发丢弃：%s 队列已满", shortID(target.deviceID))
+	}
+}
+
+// buildPresenceMsg 组装某用户当前在线列表的 presence 帧，self 标记接收方自身。
+// 调用方无需持锁；按 deviceID 去重，活跃连接优先于宽限占位连接。
+func (h *Hub) buildPresenceMsg(userID int64, self *Client) []byte {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	set := h.clients[userID]
+	if len(set) == 0 {
+		return nil
+	}
+	byDevice := make(map[string]*Client, len(set))
+	for c := range set {
+		keep, exists := byDevice[c.deviceID]
+		if !exists {
+			byDevice[c.deviceID] = c
+			continue
+		}
+		if c.grace.Load() == keep.grace.Load() {
+			if c.onlineAt.After(keep.onlineAt) {
+				byDevice[c.deviceID] = c
+			}
+		} else if !c.grace.Load() {
+			byDevice[c.deviceID] = c
+		}
+	}
+	devices := make([]*Client, 0, len(byDevice))
+	for _, c := range byDevice {
+		devices = append(devices, c)
+	}
+	list := make([]onlineDevice, 0, len(devices))
+	for _, other := range devices {
+		list = append(list, onlineDevice{
+			DeviceID: other.deviceID,
+			Role:     other.role,
+			Platform: other.platform,
+			Name:     other.name,
+			IP:       other.ip,
+			OnlineAt: other.onlineAt.UnixMilli(),
+			Self:     other == self,
+			Caps:     other.caps,
+		})
+	}
+	payload, _ := json.Marshal(map[string]any{"devices": list})
+	msg, _ := json.Marshal(Message{
+		ID:      "presence",
+		Type:    TypePresence,
+		From:    "server",
+		TS:      time.Now().UnixMilli(),
+		Payload: payload,
+	})
+	return msg
 }
 
 // Kick reason：客户端据此显示不同文案，并决定是否需要重连/改密码。
