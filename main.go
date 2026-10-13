@@ -303,6 +303,20 @@ func (h *Hub) allOnlineDeviceIDs() map[string]struct{} {
 	return m
 }
 
+// allOnlinePairs 返回所有在线连接的 (userID, deviceID) 列表，
+// 供管理端按在线/离线过滤并正确分页。
+func (h *Hub) allOnlinePairs() []OnlinePair {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]OnlinePair, 0)
+	for userID, set := range h.clients {
+		for c := range set {
+			out = append(out, OnlinePair{UserID: userID, DeviceID: c.deviceID})
+		}
+	}
+	return out
+}
+
 // renameDevice 更新某账号下指定设备所有在线连接的自定义名称，并广播 presence，
 // 让该账号所有端实时看到新名称（包括改名设备自身）。
 func (h *Hub) renameDevice(userID int64, deviceID, name string) {

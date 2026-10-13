@@ -130,8 +130,17 @@ type DeviceFilter struct {
 	Keyword  string // 模糊匹配 username / device_id / name / last_ip
 	UserID   int64  // > 0 时只查该用户
 	Disabled *bool  // 禁用状态过滤
-	Offset   int
-	Limit    int
+	// Online 非 nil 时按连接在线状态过滤；OnlinePairs 提供当前在线的 (userID, deviceID) 集合。
+	Online      *bool
+	OnlinePairs []OnlinePair
+	Offset      int
+	Limit       int
+}
+
+// OnlinePair 一个当前在线连接的归属，用于 SQL 行构造器过滤。
+type OnlinePair struct {
+	UserID   int64
+	DeviceID string
 }
 
 // DeviceRow 全量设备列表的一行：带上 username，方便管理端直接展示。
@@ -161,6 +170,23 @@ func (s *MySQLStore) ListAllDevices(ctx context.Context, f DeviceFilter) ([]*Dev
 	if f.UserID > 0 {
 		where += " AND d.user_id = ?"
 		args = append(args, f.UserID)
+	}
+	// 在线过滤：在线态只存在于 Hub 内存，下沉成 SQL 行构造器 IN/NOT IN，保证分页 total 正确。
+	if f.Online != nil && len(f.OnlinePairs) > 0 {
+		placeholders := make([]string, 0, len(f.OnlinePairs))
+		for _, p := range f.OnlinePairs {
+			placeholders = append(placeholders, "(?, ?)")
+			args = append(args, p.UserID, p.DeviceID)
+		}
+		rowCtor := "ROW(d.user_id, d.device_id) IN (" + strings.Join(placeholders, ",") + ")"
+		if *f.Online {
+			where += " AND " + rowCtor
+		} else {
+			where += " AND NOT " + rowCtor
+		}
+	} else if f.Online != nil && !*f.Online {
+		// 没有任何在线连接时，“只看离线”等价于不加限制；“只看在线”则应返回空集。
+		where += " AND 1=0"
 	}
 
 	var total int64
@@ -262,6 +288,20 @@ func (s *MySQLStore) UpdateDeviceStatus(ctx context.Context, userID int64, devic
 		}
 	}
 	return nil
+}
+
+// GetDeviceDisabled 返回指定设备是否已禁用。exists=false 表示设备不存在。
+func (s *MySQLStore) GetDeviceDisabled(ctx context.Context, userID int64, deviceID string) (disabled bool, exists bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT disabled FROM devices WHERE user_id = ? AND device_id = ? LIMIT 1`,
+		userID, deviceID).Scan(&disabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("查询设备状态失败: %w", err)
+	}
+	return disabled, true, nil
 }
 
 // deviceExists 判断指定 user_id + device_id 的设备是否存在。
