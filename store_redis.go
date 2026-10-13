@@ -200,6 +200,7 @@ const (
 	AdminActionKickDevice     AdminAction = "kick_device"
 	AdminActionDisableDevice  AdminAction = "disable_device"
 	AdminActionEnableDevice   AdminAction = "enable_device"
+	AdminActionDeleteDevice   AdminAction = "delete_device"
 )
 
 // AdminCommand 管理端通过 Redis/HTTP 发给 Server 的指令。

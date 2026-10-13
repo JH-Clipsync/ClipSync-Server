@@ -117,6 +117,12 @@ func (a *AuthService) SetDeviceStatus(ctx context.Context, userID int64, deviceI
 	return a.db.UpdateDeviceStatus(ctx, userID, deviceID, disabled)
 }
 
+// DeleteDevice 删除指定账号下一台设备的登记记录。
+// 上层在调用前会先禁用 + 踢连接，保证在线设备立即断开。
+func (a *AuthService) DeleteDevice(ctx context.Context, userID int64, deviceID string) error {
+	return a.db.DeleteDevice(ctx, userID, deviceID)
+}
+
 // GetDeviceName 查询某设备的自定义名称，不存在返回空串。
 func (a *AuthService) GetDeviceName(ctx context.Context, userID int64, deviceID string) (string, error) {
 	return a.db.GetDeviceName(ctx, userID, deviceID)

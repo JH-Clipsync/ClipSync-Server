@@ -1530,6 +1530,10 @@ func main() {
 									cmd.UserID, shortID(cmd.DeviceID), err)
 							}
 						}
+					case AdminActionDeleteDevice:
+						if cmd.DeviceID != "" {
+							deleteDeviceSafely(ctx2, cmd.UserID, cmd.DeviceID)
+						}
 					}
 				})
 				// context 被取消：优雅退出

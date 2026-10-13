@@ -299,6 +299,13 @@ func adminKick(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
+	case AdminActionDeleteDevice:
+		if cmd.DeviceID == "" {
+			http.Error(w, "缺少 device_id", http.StatusBadRequest)
+			return
+		}
+		// 未禁用的先禁用并踢下线，再删除登记记录（deleteDeviceSafely 内部幂等处理不存在）。
+		deleteDeviceSafely(ctx, cmd.UserID, cmd.DeviceID)
 	case AdminActionKickDevice:
 		if cmd.DeviceID == "" {
 			http.Error(w, "缺少 device_id", http.StatusBadRequest)
@@ -319,6 +326,31 @@ func invalidateUserSessions(ctx context.Context, userID int64) {
 	if authService != nil {
 		authService.InvalidateSessions(ctx, userID)
 	}
+}
+
+// deleteDeviceSafely 删除一台设备：未禁用的先禁用并立即踢下线，再物理删除登记记录。
+// 供 HTTP /server-admin/kick 与 Redis Pub/Sub 两条路径复用，保证行为一致。
+// 设备不存在时静默返回（删除天然幂等）。
+func deleteDeviceSafely(ctx context.Context, userID int64, deviceID string) {
+	// 未禁用的先禁用（已禁用则 SetDeviceStatus 幂等无副作用）；设备不存在会返回 NotFound。
+	if err := authService.SetDeviceStatus(ctx, userID, deviceID, true); err != nil {
+		if errors.Is(err, ErrDeviceNotFound) {
+			logInfo("🗑 删除设备跳过（不存在）: user=%d device=%s", userID, shortID(deviceID))
+			return
+		}
+		logError("⚠ 删除设备：禁用阶段失败 user=%d device=%s: %v", userID, shortID(deviceID), err)
+		return
+	}
+	// 立即断开在线连接（禁用理由，客户端不会被误导为普通踢下线）。
+	hub.kickDevice(userID, deviceID, KickReasonDeviceBanned)
+	// 物理删除登记记录。
+	if err := authService.DeleteDevice(ctx, userID, deviceID); err != nil {
+		if !errors.Is(err, ErrDeviceNotFound) {
+			logError("⚠ 删除设备失败 user=%d device=%s: %v", userID, shortID(deviceID), err)
+			return
+		}
+	}
+	logInfo("🗑 已删除设备: user=%d device=%s（已先禁用并踢下线）", userID, shortID(deviceID))
 }
 
 // int64PathParam 从路径里取一个 int64 参数，失败写 400 并返回 false。

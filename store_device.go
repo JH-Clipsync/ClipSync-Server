@@ -274,3 +274,19 @@ func (s *MySQLStore) deviceExists(ctx context.Context, userID int64, deviceID st
 	}
 	return cnt > 0, nil
 }
+
+// DeleteDevice 物理删除一台设备的登记记录。不存在返回 ErrDeviceNotFound。
+// 注意：删除只清除登记信息，设备下次握手时会按正常设备重新建档；
+// 若要持久阻止某设备连接，应对其“禁用”而非删除。
+func (s *MySQLStore) DeleteDevice(ctx context.Context, userID int64, deviceID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM devices WHERE user_id = ? AND device_id = ?`,
+		userID, deviceID)
+	if err != nil {
+		return fmt.Errorf("删除设备失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrDeviceNotFound
+	}
+	return nil
+}
