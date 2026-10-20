@@ -54,6 +54,21 @@ type Config struct {
 
 	// E2EE 端到端加密策略
 	E2EE E2EEConfig `yaml:"e2ee"`
+
+	// PublicAPI 对外开放的验证码查询接口
+	PublicAPI PublicAPIConfig `yaml:"public_api"`
+}
+
+// PublicAPIConfig 对外开放接口（验证码密文查询）配置。
+type PublicAPIConfig struct {
+	// Enabled 是否开启 /openapi/v1/sms 等开放接口
+	Enabled bool `yaml:"enabled"`
+	// CacheTTL 短信密文在 Redis 的旁路缓存时长（验证码时效，默认 10m）
+	CacheTTL time.Duration `yaml:"cache_ttl"`
+	// MaxItems 每个用户最多保留多少条近期短信密文（默认 20）
+	MaxItems int `yaml:"max_items"`
+	// MaxLookback 查询时最多返回多少条（默认 20）
+	Limit int `yaml:"limit"`
 }
 
 // ServerConfig HTTP 服务监听

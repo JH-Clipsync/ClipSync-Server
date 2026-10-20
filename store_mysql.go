@@ -117,6 +117,10 @@ func (s *MySQLStore) migrate(ctx context.Context) error {
 	if err := s.migrateDevices(ctx); err != nil {
 		return err
 	}
+	// 开放接口 ApiKey 表
+	if err := s.migrateAPIKeys(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 

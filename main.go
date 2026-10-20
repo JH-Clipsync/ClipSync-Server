@@ -129,6 +129,12 @@ const offlineGrace = 5 * time.Second
 // globalConfig 保存运行时配置，main 启动时从文件 / 环境变量加载。
 var globalConfig *Config
 
+// 开放接口（验证码密文查询 / ApiKey）复用主存储；main 启动时注入。
+var (
+	globalStore *MySQLStore
+	globalCache *RedisStore
+)
+
 // 集线器：按 token 分组管理连接
 type Hub struct {
 	mu      sync.RWMutex
@@ -263,14 +269,14 @@ func (h *Hub) finalizeGrace(c *Client) {
 
 // onlineDevice 在线列表里的单台设备信息，序列化成 presence 消息 payload。
 type onlineDevice struct {
-	DeviceID string         `json:"device_id"`
-	Role     string         `json:"role"`
-	Platform string         `json:"platform"`
-	Name     string         `json:"name"`
-	IP       string         `json:"ip"`
-	OnlineAt int64          `json:"online_at"` // 毫秒时间戳
-	Self     bool           `json:"self"`      // 是否为接收这条消息的设备本身
-	Caps     map[string]bool `json:"caps"`     // 客户端能力/同步开关
+	DeviceID string          `json:"device_id"`
+	Role     string          `json:"role"`
+	Platform string          `json:"platform"`
+	Name     string          `json:"name"`
+	IP       string          `json:"ip"`
+	OnlineAt int64           `json:"online_at"` // 毫秒时间戳
+	Self     bool            `json:"self"`      // 是否为接收这条消息的设备本身
+	Caps     map[string]bool `json:"caps"`      // 客户端能力/同步开关
 }
 
 // onlineDeviceIDs 返回某用户当前在内存 hub 中的在线 deviceID 集合。
@@ -900,6 +906,40 @@ func (c *Client) readPump() {
 			zhCategory(category), zhContent(content), zhPush(msg.Type),
 			shortID(c.deviceID), c.role, c.userID, shortToken(c.token), c.ip)
 		hub.route(c, msg.Type, out)
+
+		// 开放接口：入站短信（手机→电脑）旁路缓存一份「密文信封」，供 ApiKey 查询。
+		// 只缓存端到端密文，服务端不接触明文；开关关闭时完全旁路。
+		if encrypted && msg.Type == TypeNotifyPC {
+			cacheSMSCipherForUser(c.userID, c.deviceID, msg)
+		}
+	}
+}
+
+// cacheSMSCipherForUser best-effort 旁路缓存一条入站短信密文；任何错误只记日志，不影响中继。
+func cacheSMSCipherForUser(userID int64, fromDevice string, msg Message) {
+	if globalCache == nil || globalConfig == nil || !globalConfig.PublicAPI.Enabled {
+		return
+	}
+	ttl := globalConfig.PublicAPI.CacheTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	maxItems := globalConfig.PublicAPI.MaxItems
+	if maxItems <= 0 {
+		maxItems = 20
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := globalCache.CacheSMSCipher(ctx, userID, CachedSMS{
+		ID:         msg.ID,
+		FromDevice: fromDevice,
+		Type:       msg.Type,
+		TS:         msg.TS,
+		ReceivedAt: time.Now().Unix(),
+		Payload:    msg.Payload,
+	}, ttl, maxItems)
+	if err != nil {
+		logWarn("⚠ 短信密文旁路缓存失败 user=%d: %v", userID, err)
 	}
 }
 
@@ -917,14 +957,14 @@ func (c *Client) readPump() {
 
 var (
 	// 单个前导【xxx】块（带前后空白），用于循环定位第一个前缀
-	reLeadingBracket  = regexp.MustCompile(`^\s*【([^】]*)】\s*`)
+	reLeadingBracket = regexp.MustCompile(`^\s*【([^】]*)】\s*`)
 	// 从【】里提取号码/服务号（覆盖手机号、服务号、106 短信通道号）
-	rePhoneInside     = regexp.MustCompile(`【\s*([^】]*?)\s*】`)
+	rePhoneInside = regexp.MustCompile(`【\s*([^】]*?)\s*】`)
 	// 判断是否为号码（包含至少 3 位连续数字）
-	reDigitLike       = regexp.MustCompile(`\d{3,}`)
-	reMergeCount1     = regexp.MustCompile(`\[\s*\d+\s*条\s*\]`)
-	reMergeCount2     = regexp.MustCompile(`(?i)\[x\s*\d+\s*\]`)
-	reLeadingEllips   = regexp.MustCompile(`^\s*(?:\.{3,}|…+)\s*`)
+	reDigitLike     = regexp.MustCompile(`\d{3,}`)
+	reMergeCount1   = regexp.MustCompile(`\[\s*\d+\s*条\s*\]`)
+	reMergeCount2   = regexp.MustCompile(`(?i)\[x\s*\d+\s*\]`)
+	reLeadingEllips = regexp.MustCompile(`^\s*(?:\.{3,}|…+)\s*`)
 )
 
 func sanitizeSmsPayload(msgType string, raw json.RawMessage) json.RawMessage {
@@ -1493,7 +1533,11 @@ func main() {
 
 	authService = NewAuthService(store, cache, cfg.Auth)
 	authGate = authService
+	globalStore = store
+	globalCache = cache
 	limiter = newLoginLimiter(cfg.Auth.LoginRateLimitPerMin)
+	// 开放接口按 IP 限流：60 次/分钟（查询类，阈值高于登录）
+	openAPILimiter = newLoginLimiter(60)
 
 	// 初始账号：配置了 bootstrap_user 且该用户不存在时自动建，方便首次部署
 	bootstrapUser(store, cfg.Auth)
@@ -1585,6 +1629,15 @@ func main() {
 
 	// 普通用户 HTTP 接口（走登录 token 鉴权）
 	mux.HandleFunc("POST /device/name", requireUserToken(handleRenameDevice))
+
+	// 对外开放接口：凭 ApiKey 取最近短信密文（服务端不解密）
+	mux.HandleFunc("GET /openapi/v1/sms", openAPIQuerySMS)
+
+	// 开放接口 ApiKey 管理（走 server-admin token，供 ClipSync-Admin 调用）
+	mux.HandleFunc("POST /server-admin/users/{id}/api-keys", requireAdminToken(adminCreateAPIKey))
+	mux.HandleFunc("GET /server-admin/users/{id}/api-keys", requireAdminToken(adminListAPIKeys))
+	mux.HandleFunc("GET /server-admin/api-keys", requireAdminToken(adminListAllAPIKeys))
+	mux.HandleFunc("DELETE /server-admin/api-keys/{keyID}", requireAdminToken(adminRevokeAPIKey))
 
 	srv := &http.Server{
 		Addr:         cfg.Server.Addr,
