@@ -116,6 +116,22 @@ type Client struct {
 	// closeOnce 保证 send channel 全局只关闭一次，避免多条收尾路径
 	// （正常断开 / 被顶替 / 管理端踢下线）重复 close 触发 panic。
 	closeOnce sync.Once
+
+	// writeMu 串行化该连接的所有「数据帧」写操作。
+	// gorilla/websocket 规定同一连接同时只能有一个 goroutine 调 WriteMessage/
+	// SetWriteDeadline，否则会 panic: concurrent write to websocket connection。
+	// writePump 是常规唯一写者；sendKick 从管理指令 goroutine 直接写踢人帧时
+	// 也要抢这把锁。控制帧（Pong）走并发安全的 WriteControl，不需此锁。
+	writeMu sync.Mutex
+}
+
+// lockedWrite 在写锁保护下写一帧并设置截止时间，供 writePump 与 sendKick 共用，
+// 杜绝多个 goroutine 并发 WriteMessage 导致进程 panic。
+func (c *Client) lockedWrite(t int, msg []byte, timeout time.Duration) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(timeout))
+	return c.conn.WriteMessage(t, msg)
 }
 
 // offlineGrace 下线宽限时长：连接断开后保留 presence 的窗口。
@@ -518,8 +534,9 @@ func sendKick(c *Client, reason string) {
 		TS:      time.Now().UnixMilli(),
 		Payload: body,
 	})
-	_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_ = c.conn.WriteMessage(websocket.TextMessage, kickMsg)
+	// 踢人帧是数据帧，而本函数运行在管理指令 goroutine，必须与 writePump 互斥，
+	// 否则并发 WriteMessage 会触发 panic。lockedWrite 内部加写锁并设截止时间。
+	_ = c.lockedWrite(websocket.TextMessage, kickMsg, 2*time.Second)
 	_ = c.conn.Close()
 }
 
@@ -837,9 +854,12 @@ func (c *Client) readPump() {
 	c.conn.SetPongHandler(func(string) error { refreshDeadline(); return nil })
 	c.conn.SetPingHandler(func(appData string) error {
 		refreshDeadline()
-		// 默认行为：回一帧 Pong（控制帧允许在 readPump 上直接写）
-		c.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-		return c.conn.WriteMessage(websocket.PongMessage, []byte(appData))
+		// Pong 是控制帧，必须用 WriteControl：它在 readPump goroutine 执行，
+		// 用 WriteMessage 会和 writePump 并发写同一连接，触发
+		// "concurrent write to websocket connection" panic 打挂进程。
+		return c.conn.WriteControl(
+			websocket.PongMessage, []byte(appData), time.Now().Add(writeDeadline),
+		)
 	})
 	for {
 		_, data, err := c.conn.ReadMessage()
@@ -1141,16 +1161,22 @@ func (c *Client) writePump() {
 		select {
 		case msg, ok := <-c.send:
 			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				// 关闭帧是控制帧，WriteControl 可与其它写并发，安全
+				_ = c.conn.WriteControl(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+					time.Now().Add(writeDeadline),
+				)
 				return
 			}
-			c.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			if err := c.lockedWrite(websocket.TextMessage, msg, writeDeadline); err != nil {
 				return
 			}
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			// Ping 是控制帧，WriteControl 可与数据帧写并发，安全
+			if err := c.conn.WriteControl(
+				websocket.PingMessage, nil, time.Now().Add(writeDeadline),
+			); err != nil {
 				return
 			}
 		}
