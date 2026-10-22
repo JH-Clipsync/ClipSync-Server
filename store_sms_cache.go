@@ -13,12 +13,14 @@ import (
 // CachedSMS 旁路缓存的一条入站短信。**只含端到端密文信封**，服务端无法解密，
 // 明文（含发件号码、验证码正文）由持有同步密码的调用方取回后自行解密。
 type CachedSMS struct {
-	ID         string          `json:"id"`          // 客户端消息 ID
-	FromDevice string          `json:"from_device"` // 发送方设备 ID（mobile）
-	Type       string          `json:"type"`        // 原始消息类型（notify_pc）
-	TS         int64           `json:"ts"`          // 客户端消息时间戳（秒）
-	ReceivedAt int64           `json:"received_at"` // 服务端旁路缓存时间（秒）
-	Payload    json.RawMessage `json:"payload"`     // 原始 payload，内含 enc 密文信封
+	ID         string          `json:"id"`                 // 客户端消息 ID
+	FromDevice string          `json:"from_device"`        // 发送方设备 ID（mobile）
+	Type       string          `json:"type"`               // 原始消息类型（notify_pc）
+	TS         int64           `json:"ts"`                 // 客户端消息时间戳（秒）
+	ReceivedAt int64           `json:"received_at"`        // 服务端旁路缓存时间（秒）
+	Sender     string          `json:"sender,omitempty"`   // 短信发送号码（密文外明文元数据）
+	Receiver   string          `json:"receiver,omitempty"` // 短信接收号码/本机接码卡号（密文外明文元数据）
+	Payload    json.RawMessage `json:"payload"`            // 原始 payload，内含 enc 密文信封
 }
 
 func (s *RedisStore) smsCacheKey(userID int64) string {

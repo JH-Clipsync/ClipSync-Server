@@ -55,7 +55,43 @@ func generateAPIKey() (plaintext, hash, short string, err error) {
 	return plaintext, hash, short, nil
 }
 
-// bearerOrHeader 从 Authorization: Bearer 或 X-API-Key 取密钥。
+// normalizePhoneQuery 归一化号码：去空白/连字符/括号等分隔符，字母转小写，只保留字母数字。
+func normalizePhoneQuery(s string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + 32)
+		}
+	}
+	return b.String()
+}
+
+// phoneEqual 判断两个号码是否同一号：归一化后相等，或去掉 86 国家码前缀后相等
+// （兼容 138… 与 86138…/＋86138… 写法；发件短号不含 86 前缀时走第一条直接比较）。
+func phoneEqual(actual, query string) bool {
+	a := normalizePhoneQuery(actual)
+	q := normalizePhoneQuery(query)
+	if a == "" || q == "" {
+		return false
+	}
+	if a == q {
+		return true
+	}
+	stripCN := func(x string) string {
+		if strings.HasPrefix(x, "86") && len(x) == 13 {
+			return x[2:]
+		}
+		return x
+	}
+	return stripCN(a) == stripCN(q)
+}
+
+// bearerOrHeader 从 Authorization: Bearer *** X-API-Key 取密钥。
 func extractAPIKey(r *http.Request) string {
 	if v := strings.TrimSpace(r.Header.Get("X-API-Key")); v != "" {
 		return v
@@ -69,14 +105,16 @@ func extractAPIKey(r *http.Request) string {
 
 // ==================== 对外开放接口 ====================
 
-// openAPISMSItem 单条短信密文返回项。payload 即原始端到端信封（含 enc），
-// 调用方用同步密码解密后才能拿到发件号码与验证码正文。
+// openAPISMSItem 单条短信返回项。payload 内仍是端到端密文信封；
+// sender/receiver 是信封外明文号码元数据，仅用于服务端按号码筛选。
 type openAPISMSItem struct {
 	ID         string          `json:"id"`
 	FromDevice string          `json:"from_device"`
 	Type       string          `json:"type"`
 	TS         int64           `json:"ts"`
 	ReceivedAt int64           `json:"received_at"`
+	Sender     string          `json:"sender,omitempty"`
+	Receiver   string          `json:"receiver,omitempty"`
 	Payload    json.RawMessage `json:"payload"`
 }
 
@@ -135,8 +173,24 @@ func openAPIQuerySMS(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
+	receiverFilter := normalizePhoneQuery(r.URL.Query().Get("receiver"))
+	if receiverFilter == "" {
+		// 兼容旧语义：phone 表示要查的本机收端卡号
+		receiverFilter = normalizePhoneQuery(r.URL.Query().Get("phone"))
+	}
+	senderFilter := normalizePhoneQuery(r.URL.Query().Get("sender"))
 
-	raw, err := globalCache.RecentSMSCipher(ctx, key.UserID, ttl, limit)
+	// 号码过滤在服务端完成，先取该用户 TTL 窗口内的完整短缓存，再过滤截断。
+	// 不能只取 limit 条后过滤，否则最新 N 条不匹配时会漏掉稍早的目标短信。
+	fetchLimit := globalConfig.PublicAPI.MaxItems
+	if fetchLimit < limit {
+		fetchLimit = limit
+	}
+	if fetchLimit <= 0 {
+		fetchLimit = 20
+	}
+
+	raw, err := globalCache.RecentSMSCipher(ctx, key.UserID, ttl, fetchLimit)
 	if err != nil {
 		logError("开放接口读取短信缓存失败 user=%d: %v", key.UserID, err)
 		writeErr(w, http.StatusInternalServerError, "读取失败")
@@ -149,8 +203,15 @@ func openAPIQuerySMS(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(b, &c); err != nil {
 			continue
 		}
-		// 若密钥限定了移动设备，只返回该设备的短信密文
+		// 若密钥限定了移动设备，只返回该设备的短信
 		if key.DeviceID != "" && c.FromDevice != key.DeviceID {
+			continue
+		}
+		// 按收端卡号（本机接码号）/ 发端号码在服务端明文元数据上过滤
+		if receiverFilter != "" && !phoneEqual(c.Receiver, receiverFilter) {
+			continue
+		}
+		if senderFilter != "" && !phoneEqual(c.Sender, senderFilter) {
 			continue
 		}
 		items = append(items, openAPISMSItem{
@@ -159,8 +220,13 @@ func openAPIQuerySMS(w http.ResponseWriter, r *http.Request) {
 			Type:       c.Type,
 			TS:         c.TS,
 			ReceivedAt: c.ReceivedAt,
+			Sender:     c.Sender,
+			Receiver:   c.Receiver,
 			Payload:    c.Payload,
 		})
+		if len(items) >= limit {
+			break
+		}
 	}
 
 	globalStore.TouchAPIKeyUsed(ctx, key.ID)

@@ -950,12 +950,23 @@ func cacheSMSCipherForUser(userID int64, fromDevice string, msg Message) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+
+	// 号码是密文信封外的明文元数据（正文仍在 enc 中），服务端只读取这两个字段
+	// 用于开放接口筛选，不解析/记录 enc 内任何正文。
+	var meta struct {
+		Sender   string `json:"sender"`
+		Receiver string `json:"receiver"`
+	}
+	_ = json.Unmarshal(msg.Payload, &meta)
+
 	err := globalCache.CacheSMSCipher(ctx, userID, CachedSMS{
 		ID:         msg.ID,
 		FromDevice: fromDevice,
 		Type:       msg.Type,
 		TS:         msg.TS,
 		ReceivedAt: time.Now().Unix(),
+		Sender:     strings.TrimSpace(meta.Sender),
+		Receiver:   strings.TrimSpace(meta.Receiver),
 		Payload:    msg.Payload,
 	}, ttl, maxItems)
 	if err != nil {
