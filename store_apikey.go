@@ -19,7 +19,6 @@ type APIKey struct {
 	KeyHash    string
 	KeyPrefix  string // 明文前缀，仅供后台辨识（如 cs_live_ab12…）
 	Name       string // 备注/用途
-	Phone      string // 绑定的收件号码（接码卡号），由管理员填写
 	DeviceID   string // 可选：限定某台移动设备（对应中继消息的 from）
 	ExpiresAt  sql.NullTime
 	Disabled   bool
@@ -35,7 +34,6 @@ func (s *MySQLStore) migrateAPIKeys(ctx context.Context) error {
 		key_hash    CHAR(64)     NOT NULL,
 		key_prefix  VARCHAR(24)  NOT NULL DEFAULT '',
 		name        VARCHAR(64)  NOT NULL DEFAULT '',
-		phone       VARCHAR(32)  NOT NULL DEFAULT '',
 		device_id   VARCHAR(64)  NOT NULL DEFAULT '',
 		expires_at  DATETIME     NULL,
 		disabled    TINYINT(1)   NOT NULL DEFAULT 0,
@@ -56,9 +54,9 @@ func (s *MySQLStore) migrateAPIKeys(ctx context.Context) error {
 func (s *MySQLStore) CreateAPIKey(ctx context.Context, k *APIKey) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO api_keys
-		   (user_id, key_hash, key_prefix, name, phone, device_id, expires_at, disabled)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-		k.UserID, k.KeyHash, k.KeyPrefix, k.Name, k.Phone, k.DeviceID, k.ExpiresAt)
+		   (user_id, key_hash, key_prefix, name, device_id, expires_at, disabled)
+		 VALUES (?, ?, ?, ?, ?, ?, 0)`,
+		k.UserID, k.KeyHash, k.KeyPrefix, k.Name, k.DeviceID, k.ExpiresAt)
 	if err != nil {
 		return 0, fmt.Errorf("创建 API Key 失败: %w", err)
 	}
@@ -69,7 +67,7 @@ func (s *MySQLStore) CreateAPIKey(ctx context.Context, k *APIKey) (int64, error)
 // GetAPIKeyByHash 按哈希查一条启用中的密钥（供开放接口鉴权）。
 func (s *MySQLStore) GetAPIKeyByHash(ctx context.Context, hash string) (*APIKey, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, user_id, key_hash, key_prefix, name, phone, device_id,
+		`SELECT id, user_id, key_hash, key_prefix, name, device_id,
 		        expires_at, disabled, last_used_at, created_at
 		   FROM api_keys WHERE key_hash = ? LIMIT 1`, hash)
 	return scanAPIKey(row)
@@ -78,7 +76,7 @@ func (s *MySQLStore) GetAPIKeyByHash(ctx context.Context, hash string) (*APIKey,
 // ListAPIKeys 列出密钥；userID>0 时只看该用户。JOIN users 带出 username。
 func (s *MySQLStore) ListAPIKeys(ctx context.Context, userID int64) ([]*APIKey, error) {
 	q := `SELECT k.id, k.user_id, COALESCE(u.username,''), k.key_hash, k.key_prefix, k.name,
-	             k.phone, k.device_id, k.expires_at, k.disabled, k.last_used_at, k.created_at
+	             k.device_id, k.expires_at, k.disabled, k.last_used_at, k.created_at
 	        FROM api_keys k LEFT JOIN users u ON u.id = k.user_id`
 	args := []any{}
 	if userID > 0 {
@@ -133,7 +131,7 @@ func scanAPIKey(row scannable) (*APIKey, error) {
 	var k APIKey
 	var disabled int
 	if err := row.Scan(&k.ID, &k.UserID, &k.KeyHash, &k.KeyPrefix, &k.Name,
-		&k.Phone, &k.DeviceID, &k.ExpiresAt, &disabled, &k.LastUsedAt, &k.CreatedAt); err != nil {
+		&k.DeviceID, &k.ExpiresAt, &disabled, &k.LastUsedAt, &k.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrAPIKeyNotFound
 		}
@@ -148,7 +146,7 @@ func scanAPIKeyWithUsername(row scannable) (*APIKey, error) {
 	var k APIKey
 	var disabled int
 	if err := row.Scan(&k.ID, &k.UserID, &k.Username, &k.KeyHash, &k.KeyPrefix, &k.Name,
-		&k.Phone, &k.DeviceID, &k.ExpiresAt, &disabled, &k.LastUsedAt, &k.CreatedAt); err != nil {
+		&k.DeviceID, &k.ExpiresAt, &disabled, &k.LastUsedAt, &k.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrAPIKeyNotFound
 		}

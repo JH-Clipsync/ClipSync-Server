@@ -232,7 +232,6 @@ func openAPIQuerySMS(w http.ResponseWriter, r *http.Request) {
 	globalStore.TouchAPIKeyUsed(ctx, key.ID)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"phone":     key.Phone, // 该密钥绑定的收件号码（接码卡号），供调用方自检
 		"device_id": key.DeviceID,
 		"count":     len(items),
 		"items":     items,
@@ -243,7 +242,6 @@ func openAPIQuerySMS(w http.ResponseWriter, r *http.Request) {
 
 type createAPIKeyReq struct {
 	Name      string `json:"name"`
-	Phone     string `json:"phone"`
 	DeviceID  string `json:"device_id"`
 	ExpiresAt string `json:"expires_at"` // RFC3339；留空表示无限期
 }
@@ -280,7 +278,6 @@ func adminCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		KeyHash:   hash,
 		KeyPrefix: short,
 		Name:      strings.TrimSpace(body.Name),
-		Phone:     strings.TrimSpace(body.Phone),
 		DeviceID:  strings.TrimSpace(body.DeviceID),
 	}
 	if strings.TrimSpace(body.ExpiresAt) != "" {
@@ -298,14 +295,13 @@ func adminCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logError("🔑 已为用户 %d 创建开放接口 ApiKey id=%d phone=%s", userID, id, k.Phone)
+	logError("🔑 已为用户 %d 创建开放接口 ApiKey id=%d", userID, id)
 	// 明文密钥仅此一次返回
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":         id,
 		"api_key":    plaintext,
 		"key_prefix": short,
 		"name":       k.Name,
-		"phone":      k.Phone,
 		"device_id":  k.DeviceID,
 		"expires_at": nullableTimeRFC3339(k.ExpiresAt),
 		"created_at": time.Now().Format(time.RFC3339),
@@ -320,7 +316,6 @@ type apiKeyAdminView struct {
 	Username   string `json:"username"`
 	KeyPrefix  string `json:"key_prefix"`
 	Name       string `json:"name"`
-	Phone      string `json:"phone"`
 	DeviceID   string `json:"device_id"`
 	ExpiresAt  string `json:"expires_at"`
 	Disabled   bool   `json:"disabled"`
@@ -337,7 +332,6 @@ func toAPIKeyView(k *APIKey) apiKeyAdminView {
 		Username:   k.Username,
 		KeyPrefix:  k.KeyPrefix,
 		Name:       k.Name,
-		Phone:      k.Phone,
 		DeviceID:   k.DeviceID,
 		ExpiresAt:  nullableTimeRFC3339(k.ExpiresAt),
 		Disabled:   k.Disabled,
