@@ -804,8 +804,10 @@ func (h *Hub) route(sender *Client, msgType string, raw []byte) {
 			continue
 		}
 		onlineCount++
-		// 铁律 1：永远不发回给自己
-		if c == sender {
+		// 铁律 1：同一 deviceID 的所有连接都不接收本机消息。
+		// 只排除 sender 指针会让重连残留/多实例的另一条同设备连接收到回环，
+		// 再次写入本机剪贴板并弹通知。register 的顶替不能替代这层路由不变量。
+		if c.deviceID == sender.deviceID {
 			continue
 		}
 		// 铁律 2：role 不匹配的直接跳过
